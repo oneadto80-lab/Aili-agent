@@ -7,27 +7,10 @@ use tokio::sync::mpsc;
 use crate::chat::{ChatRequest, Message, StreamChunk};
 use crate::config::ResolvedConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamOutcome {
-    /// Server sent its terminal `[DONE]` (or the stream closed cleanly).
-    Done,
-    /// User cancelled mid-stream.
-    Cancelled,
-}
+use super::{StreamEvent, StreamOutcome};
 
-#[derive(Debug, Clone)]
-pub enum StreamEvent {
-    Token(String),
-}
-
-/// POST a streaming chat completion. Token deltas are delivered through `tx`
-/// as they arrive; the function returns once the stream finishes, is
-/// cancelled, or errors. The receiver decides what to do with each token
-/// (write to stdout, append to a TUI widget, etc).
-///
-/// `cancel` is awaited concurrently with the event stream; if it resolves
-/// first, we abort and return `Cancelled`.
-pub async fn run_stream(
+/// POST /v1/chat/completions with stream=true and parse OpenAI-style SSE.
+pub async fn run(
     client: &reqwest::Client,
     cfg: &ResolvedConfig,
     messages: &[Message],
@@ -37,10 +20,7 @@ pub async fn run_stream(
     let url = format!("{}/chat/completions", cfg.base_url);
     let body = ChatRequest::build(cfg, messages);
 
-    let req = client
-        .post(&url)
-        .bearer_auth(&cfg.api_key)
-        .json(&body);
+    let req = client.post(&url).bearer_auth(&cfg.api_key).json(&body);
 
     let mut es = EventSource::new(req).context("failed to start SSE request")?;
     tokio::pin!(cancel);
@@ -65,9 +45,7 @@ pub async fn run_stream(
                         }
                         let chunk: StreamChunk = match serde_json::from_str(&m.data) {
                             Ok(c) => c,
-                            Err(e) => {
-                                bail!("malformed stream chunk: {e}\nraw: {}", m.data);
-                            }
+                            Err(e) => bail!("malformed stream chunk: {e}\nraw: {}", m.data),
                         };
                         for choice in &chunk.choices {
                             if let Some(text) = &choice.delta.content {
@@ -83,7 +61,7 @@ pub async fn run_stream(
                     }
                     Err(e) => {
                         es.close();
-                        return Err(format_stream_error(cfg, e).await);
+                        return Err(format_error(cfg, e).await);
                     }
                 }
             }
@@ -91,7 +69,7 @@ pub async fn run_stream(
     }
 }
 
-async fn format_stream_error(cfg: &ResolvedConfig, err: reqwest_eventsource::Error) -> anyhow::Error {
+async fn format_error(cfg: &ResolvedConfig, err: reqwest_eventsource::Error) -> anyhow::Error {
     use reqwest_eventsource::Error as E;
     match err {
         E::InvalidStatusCode(status, resp) => {
@@ -124,26 +102,5 @@ async fn format_stream_error(cfg: &ResolvedConfig, err: reqwest_eventsource::Err
             cfg.provider.as_str(),
             other
         ),
-    }
-}
-
-/// For local providers, do a cheap GET /models to surface "server is down"
-/// before we dive into a streaming POST.
-pub async fn probe_local(client: &reqwest::Client, cfg: &ResolvedConfig) -> Result<()> {
-    if !cfg.provider.is_local() {
-        return Ok(());
-    }
-    let url = format!("{}/models", cfg.base_url);
-    match client.get(&url).bearer_auth(&cfg.api_key).send().await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            anyhow::bail!(
-                "could not reach {} ({}): {}\nhint: {}",
-                cfg.base_url,
-                cfg.provider.as_str(),
-                e,
-                cfg.provider.unreachable_hint()
-            )
-        }
     }
 }

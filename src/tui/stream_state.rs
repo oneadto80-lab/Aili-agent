@@ -34,6 +34,9 @@ impl StreamState {
             .unwrap_or(false)
     }
     pub fn drain_pending(&mut self) -> String {
+        self.drain_all()
+    }
+    pub fn drain_all(&mut self) -> String {
         let mut s = String::new();
         while let Some((_, t)) = self.pending.pop_front() {
             s.push_str(&t);
@@ -43,5 +46,19 @@ impl StreamState {
     #[allow(dead_code)]
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_all_flushes_tokens_before_ready_threshold() {
+        let mut stream = StreamState::new();
+        stream.enqueue("你的吗".to_string());
+        assert!(!stream.ready());
+        assert_eq!(stream.drain_all(), "你的吗");
+        assert!(!stream.has_pending());
     }
 }

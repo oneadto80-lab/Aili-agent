@@ -8,11 +8,11 @@ use crossterm::event::{
     KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use futures_util::StreamExt;
 use ratatui::Terminal;
-use ratatui::Viewport;
-use ratatui::TerminalOptions;
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::Block;
 use std::io::{Stdout, stdout};
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tui_textarea::{Input, Key, TextArea};
 
-use crate::chat::Message;
+use crate::chat::{Message, prepend_system_prompt};
 use crate::config::ResolvedConfig;
 use crate::stream::{StreamEvent, StreamOutcome, run_stream};
 
@@ -28,8 +28,6 @@ use self::keymap::{Action, KeyContext};
 use self::stream_state::StreamState;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
-
-const INLINE_HEIGHT: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
@@ -66,22 +64,31 @@ pub async fn run(cfg: ResolvedConfig, client: reqwest::Client) -> Result<()> {
 
 fn setup_terminal() -> Result<Term> {
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout(), EnableBracketedPaste).context("enable bracketed paste")?;
-    let backend = CrosstermBackend::new(stdout());
-    Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(INLINE_HEIGHT),
-        },
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        EnableBracketedPaste
     )
-    .context("init terminal")
+    .context("enter fullscreen terminal")?;
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend).context("init terminal")?;
+    terminal.clear().ok();
+    terminal.hide_cursor().ok();
+    Ok(terminal)
 }
 
 fn restore_terminal(term: &mut Term) -> Result<()> {
-    execute!(term.backend_mut(), DisableBracketedPaste).ok();
+    term.clear().ok();
+    execute!(
+        term.backend_mut(),
+        DisableBracketedPaste,
+        Clear(ClearType::All),
+        LeaveAlternateScreen
+    )
+    .ok();
     disable_raw_mode().ok();
     term.show_cursor().ok();
-    println!();
     Ok(())
 }
 
@@ -97,9 +104,6 @@ pub(crate) struct App {
     pub quit: bool,
     pub ctrl_c_arm: Option<CtrlCArm>,
     pub status_msg: Option<(String, Instant)>,
-    /// Bytes of the current assistant response not yet committed to scrollback.
-    pub live_buffer: String,
-    pub welcome_done: bool,
     pub submit_pending: bool,
 }
 
@@ -118,28 +122,25 @@ impl App {
             quit: false,
             ctrl_c_arm: None,
             status_msg: None,
-            live_buffer: String::new(),
-            welcome_done: false,
             submit_pending: false,
         }
     }
 
     async fn run(mut self, term: &mut Term) -> Result<()> {
-        self.write_welcome(term)?;
         let mut events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(50));
 
         loop {
-            self.flush_stream(term)?;
+            self.flush_stream()?;
             self.expire_timed();
-            term.draw(|f| render::draw_inline(&self, f))?;
+            term.draw(|f| render::draw_fullscreen(&self, f))?;
             if self.quit {
                 break;
             }
             tokio::select! {
                 biased;
                 Some(app_ev) = self.app_rx.recv() => {
-                    self.on_app_event(app_ev, term)?;
+                    self.on_app_event(app_ev)?;
                 }
                 Some(ev) = events.next() => {
                     match ev {
@@ -156,95 +157,27 @@ impl App {
         Ok(())
     }
 
-    fn write_welcome(&mut self, term: &mut Term) -> Result<()> {
-        if self.welcome_done {
-            return Ok(());
-        }
-        let lines = render::welcome_card_lines(&self.cfg.model, env!("CARGO_PKG_VERSION"));
-        let h = lines.len() as u16;
-        term.insert_before(h, |buf| render::paint_lines(buf, lines))
-            .context("insert welcome")?;
-        self.welcome_done = true;
-        Ok(())
-    }
-
-    fn write_user_to_scrollback(&mut self, term: &mut Term, text: &str) -> Result<()> {
-        let width = term.size()?.width as usize;
-        let lines = render::user_message_lines(text, width);
-        let h = lines.len() as u16;
-        term.insert_before(h, |buf| render::paint_lines(buf, lines))
-            .context("insert user message")?;
-        Ok(())
-    }
-
-    fn write_assistant_header(&mut self, term: &mut Term) -> Result<()> {
-        let lines = render::assistant_header_lines();
-        let h = lines.len() as u16;
-        term.insert_before(h, |buf| render::paint_lines(buf, lines))
-            .context("insert assistant header")?;
-        Ok(())
-    }
-
-    fn write_assistant_chunk(&mut self, term: &mut Term, text: &str) -> Result<()> {
-        if text.is_empty() {
-            return Ok(());
-        }
-        let width = term.size()?.width as usize;
-        let lines = render::assistant_body_lines(text, width);
-        let h = lines.len() as u16;
-        if h == 0 {
-            return Ok(());
-        }
-        term.insert_before(h, |buf| render::paint_lines(buf, lines))
-            .context("insert assistant chunk")?;
-        Ok(())
-    }
-
-    fn write_note(&mut self, term: &mut Term, note: &str) -> Result<()> {
-        let lines = render::note_lines(note);
-        let h = lines.len() as u16;
-        term.insert_before(h, |buf| render::paint_lines(buf, lines))
-            .context("insert note")?;
-        Ok(())
-    }
-
-    fn write_separator(&mut self, term: &mut Term) -> Result<()> {
-        let lines = render::turn_separator();
-        let h = lines.len() as u16;
-        term.insert_before(h, |buf| render::paint_lines(buf, lines))
-            .context("insert separator")?;
-        Ok(())
-    }
-
-    fn on_app_event(&mut self, ev: AppEvent, term: &mut Term) -> Result<()> {
+    fn on_app_event(&mut self, ev: AppEvent) -> Result<()> {
         match ev {
             AppEvent::StreamFinished(res) => {
-                // Drain any final batched tokens.
-                self.flush_stream(term)?;
-                // Whatever's left in live_buffer (no trailing \n) goes to scrollback.
-                if !self.live_buffer.is_empty() {
-                    let tail = std::mem::take(&mut self.live_buffer);
-                    if let Some(last) = self.history.last_mut() {
-                        if last.role == Role::Assistant {
-                            last.text.push_str(&tail);
-                        }
-                    }
-                    self.write_assistant_chunk(term, &tail)?;
-                }
+                self.drain_in_flight_tokens();
+                let final_pending = self.stream.drain_all();
+                self.append_assistant_text(&final_pending);
                 self.in_flight = None;
                 match res {
-                    Ok(StreamOutcome::Done) => self.write_separator(term)?,
-                    Ok(StreamOutcome::Cancelled) => {
-                        self.write_note(term, "(cancelled)")?;
-                    }
+                    Ok(StreamOutcome::Done) => {}
+                    Ok(StreamOutcome::Cancelled) => self.append_assistant_text("\n(cancelled)"),
                     Err(e) => {
-                        self.write_note(term, &format!("error: {e:#}"))?;
                         if matches!(
                             self.history.last(),
                             Some(m) if m.role == Role::Assistant && m.text.is_empty()
                         ) {
                             self.history.pop();
                         }
+                        self.history.push(UiMessage {
+                            role: Role::Assistant,
+                            text: format!("error: {e:#}"),
+                        });
                     }
                 }
                 if matches!(
@@ -314,21 +247,47 @@ impl App {
     }
 
     fn cancel_stream(&mut self) {
+        let mut should_drain = false;
         if let Some(f) = self.in_flight.as_mut() {
             if let Some(tx) = f.cancel_tx.take() {
                 let _ = tx.send(());
             }
-            // Drain whatever is already buffered in the channel so it isn't lost.
+            should_drain = true;
+        }
+        if should_drain {
+            self.drain_in_flight_tokens();
+        }
+    }
+
+    fn drain_in_flight_tokens(&mut self) {
+        if let Some(f) = self.in_flight.as_mut() {
             while let Ok(StreamEvent::Token(t)) = f.token_rx.try_recv() {
                 self.stream.enqueue(t);
             }
         }
     }
 
-    fn submit(&mut self, term: &mut Term) -> Result<()> {
+    fn append_assistant_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = self.history.last_mut() {
+            if last.role == Role::Assistant {
+                last.text.push_str(text);
+                return;
+            }
+        }
+        self.history.push(UiMessage {
+            role: Role::Assistant,
+            text: text.to_string(),
+        });
+    }
+
+    fn submit(&mut self) -> Result<()> {
         if self.in_flight.is_some() {
             return Ok(());
         }
+        let _ = self.stream.drain_all();
         let text = self.composer.lines().join("\n").trim().to_string();
         if text.is_empty() {
             return Ok(());
@@ -340,23 +299,28 @@ impl App {
             return Ok(());
         }
 
-        // Push user to scrollback immediately and to history for context.
-        self.write_user_to_scrollback(term, &text)?;
-        self.history.push(UiMessage { role: Role::User, text: text.clone() });
-        self.history.push(UiMessage { role: Role::Assistant, text: String::new() });
+        self.history.push(UiMessage {
+            role: Role::User,
+            text: text.clone(),
+        });
+        self.history.push(UiMessage {
+            role: Role::Assistant,
+            text: String::new(),
+        });
 
-        // Header for the assistant turn — body lines stream in below.
-        self.write_assistant_header(term)?;
-
-        let messages: Vec<Message> = self
-            .history
-            .iter()
-            .filter(|m| m.role == Role::User || (m.role == Role::Assistant && !m.text.is_empty()))
-            .map(|m| match m.role {
-                Role::User => Message::user(m.text.clone()),
-                Role::Assistant => Message::assistant(m.text.clone()),
-            })
-            .collect();
+        let messages = prepend_system_prompt(
+            &self.cfg,
+            self.history
+                .iter()
+                .filter(|m| {
+                    m.role == Role::User || (m.role == Role::Assistant && !m.text.is_empty())
+                })
+                .map(|m| match m.role {
+                    Role::User => Message::user(m.text.clone()),
+                    Role::Assistant => Message::assistant(m.text.clone()),
+                })
+                .collect(),
+        );
 
         let (token_tx, token_rx) = mpsc::channel::<StreamEvent>(64);
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -384,7 +348,7 @@ impl App {
             "exit" | "quit" => self.quit = true,
             "clear" => {
                 self.history.clear();
-                self.flash("(history cleared — terminal scrollback unaffected)".to_string());
+                self.flash("(history cleared)".to_string());
             }
             "model" => match parts.next() {
                 Some(m) => {
@@ -402,38 +366,19 @@ impl App {
                 "temperature={:?}  top_p={:?}  max_tokens={:?}",
                 self.cfg.temperature, self.cfg.top_p, self.cfg.max_tokens
             )),
-            "help" => self.flash(
-                "/model [name] /provider /params /clear /exit  ·  scroll: trackpad/wheel/Cmd+↑↓".to_string()
-            ),
+            "help" => self.flash("/model [name] /provider /params /clear /exit".to_string()),
             other => self.flash(format!("unknown command: /{other} (try /help)")),
         }
     }
 
-    /// Drain ready-to-commit lines from `live_buffer` into scrollback. A line
-    /// is "ready" when it's terminated by `\n`. Anything trailing without a
-    /// newline stays in the buffer until the stream finishes.
-    fn flush_stream(&mut self, term: &mut Term) -> Result<()> {
-        // Pull batched tokens out of the StreamState policy first.
+    fn flush_stream(&mut self) -> Result<()> {
         if self.stream.ready() {
             let chunk = self.stream.drain_pending();
-            self.live_buffer.push_str(&chunk);
+            self.append_assistant_text(&chunk);
         }
-        // Commit each completed line.
-        while let Some(idx) = self.live_buffer.find('\n') {
-            let line: String = self.live_buffer.drain(..=idx).collect();
-            if let Some(last) = self.history.last_mut() {
-                if last.role == Role::Assistant {
-                    last.text.push_str(&line);
-                }
-            }
-            self.write_assistant_chunk(term, line.trim_end_matches('\n'))?;
-        }
-
-        // Handle deferred submit (Enter): we couldn't call `submit` from
-        // on_key because it needs &mut Term.
         if self.submit_pending {
             self.submit_pending = false;
-            self.submit(term)?;
+            self.submit()?;
         }
         Ok(())
     }
@@ -458,7 +403,6 @@ impl App {
 
 fn fresh_composer() -> TextArea<'static> {
     let mut t = TextArea::default();
-    t.set_placeholder_text("type your message — Enter to send, Shift+Enter for newline");
     t.set_block(Block::default());
     t
 }

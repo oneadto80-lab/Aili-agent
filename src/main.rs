@@ -1,17 +1,18 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use aili::chat::Message;
-use aili::config::{self, ResolvedConfig};
+use aili::chat::{Message, prepend_system_prompt};
+use aili::config::{self, LoadResult, ResolvedConfig};
 use aili::stream::{StreamEvent, StreamOutcome, probe_local, run_stream};
+use aili::wizard;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
-#[command(name = "aili", version, about = "Memory-first companion agent (v0.1: chat-only MVP)")]
+#[command(name = "aili", version, about = "Memory-first companion agent")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -21,6 +22,8 @@ enum Cmd {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Re-run the first-time setup wizard.
+    Init,
     /// Start an interactive chat (or run a single turn with --once).
     Chat {
         /// Run a single turn with the given prompt and exit.
@@ -48,12 +51,12 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Config { action } => match action {
+        Some(Cmd::Config { action }) => match action {
             ConfigAction::Init => {
                 let path = config::config_path()?;
                 config::write_template(&path)?;
                 println!("wrote config template to {}", path.display());
-                println!("set your API key env var (e.g. export DEEPSEEK_API_KEY=sk-...) and run `aili chat`.");
+                println!("edit it or run `aili init` to use the wizard.");
                 Ok(())
             }
             ConfigAction::Path => {
@@ -61,14 +64,43 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::Chat { once } => {
-            let cfg = config::load()?;
+        Some(Cmd::Init) => wizard::run(),
+        Some(Cmd::Chat { once }) => {
+            let cfg = match config::load()? {
+                LoadResult::Loaded(c) => c,
+                LoadResult::NeedsInit => {
+                    wizard::run()?;
+                    match config::load()? {
+                        LoadResult::Loaded(c) => c,
+                        LoadResult::NeedsInit => {
+                            anyhow::bail!("wizard finished but config still uninitialized")
+                        }
+                    }
+                }
+            };
             let client = build_client()?;
             probe_local(&client, &cfg).await?;
             match once {
                 Some(prompt) => once_turn(&client, &cfg, prompt).await,
                 None => aili::tui::run(cfg, client).await,
             }
+        }
+        None => {
+            let cfg = match config::load()? {
+                LoadResult::Loaded(c) => c,
+                LoadResult::NeedsInit => {
+                    wizard::run()?;
+                    match config::load()? {
+                        LoadResult::Loaded(c) => c,
+                        LoadResult::NeedsInit => {
+                            anyhow::bail!("wizard finished but config still uninitialized")
+                        }
+                    }
+                }
+            };
+            let client = build_client()?;
+            probe_local(&client, &cfg).await?;
+            aili::tui::run(cfg, client).await
         }
     }
 }
@@ -81,7 +113,7 @@ fn build_client() -> Result<reqwest::Client> {
 }
 
 async fn once_turn(client: &reqwest::Client, cfg: &ResolvedConfig, prompt: String) -> Result<()> {
-    let messages = vec![Message::user(prompt)];
+    let messages = prepend_system_prompt(cfg, vec![Message::user(prompt)]);
     let cancel = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -104,4 +136,3 @@ async fn once_turn(client: &reqwest::Client, cfg: &ResolvedConfig, prompt: Strin
     }
     Ok(())
 }
-

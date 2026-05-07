@@ -17,7 +17,8 @@ anyhow = "1"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }
 tui-textarea = "0.7"
-textwrap = "0.16"
+unicode-width = "0.2"
+rpassword = "7"
 
 [dev-dependencies]
 wiremock = "0.6"

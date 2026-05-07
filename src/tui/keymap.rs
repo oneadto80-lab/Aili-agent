@@ -16,9 +16,8 @@ pub enum KeyContext {
 /// itself so that future configurable keymaps can swap the resolver without
 /// touching the App loop.
 ///
-/// Note: scrolling actions are intentionally absent — the inline viewport
-/// architecture pushes completed history into terminal scrollback, so the
-/// terminal handles wheel / trackpad / Cmd+↑↓ natively.
+/// Note: scrolling actions are intentionally absent for now. The fullscreen
+/// renderer keeps the current visible transcript in app state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Submit,
@@ -69,7 +68,10 @@ mod tests {
 
     #[test]
     fn ctrl_c_streaming_cancels() {
-        let r = resolve(&key(KeyCode::Char('c'), KeyModifiers::CONTROL), KeyContext::Streaming);
+        let r = resolve(
+            &key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyContext::Streaming,
+        );
         assert_eq!(r, Action::CancelStream);
     }
 
@@ -90,11 +92,17 @@ mod tests {
     #[test]
     fn enter_submits_shift_enter_newlines() {
         assert_eq!(
-            resolve(&key(KeyCode::Enter, KeyModifiers::NONE), KeyContext::IdleUnarmed),
+            resolve(
+                &key(KeyCode::Enter, KeyModifiers::NONE),
+                KeyContext::IdleUnarmed
+            ),
             Action::Submit
         );
         assert_eq!(
-            resolve(&key(KeyCode::Enter, KeyModifiers::SHIFT), KeyContext::IdleUnarmed),
+            resolve(
+                &key(KeyCode::Enter, KeyModifiers::SHIFT),
+                KeyContext::IdleUnarmed
+            ),
             Action::InsertNewline
         );
     }
@@ -102,7 +110,10 @@ mod tests {
     #[test]
     fn ctrl_d_quits() {
         assert_eq!(
-            resolve(&key(KeyCode::Char('d'), KeyModifiers::CONTROL), KeyContext::IdleUnarmed),
+            resolve(
+                &key(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                KeyContext::IdleUnarmed
+            ),
             Action::QuitNow
         );
     }
@@ -110,7 +121,10 @@ mod tests {
     #[test]
     fn unknown_keys_forward_to_composer() {
         assert_eq!(
-            resolve(&key(KeyCode::Char('x'), KeyModifiers::NONE), KeyContext::IdleUnarmed),
+            resolve(
+                &key(KeyCode::Char('x'), KeyModifiers::NONE),
+                KeyContext::IdleUnarmed
+            ),
             Action::ForwardToComposer
         );
     }
