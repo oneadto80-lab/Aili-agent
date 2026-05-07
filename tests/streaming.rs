@@ -1,8 +1,9 @@
 use aili::chat::Message;
 use aili::config::ResolvedConfig;
 use aili::provider::Provider;
-use aili::stream::{StreamOutcome, run_stream};
+use aili::stream::{StreamEvent, StreamOutcome, run_stream};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -33,6 +34,14 @@ fn sse_body(deltas: &[&str]) -> String {
     out
 }
 
+async fn collect(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    while let Some(StreamEvent::Token(t)) = rx.recv().await {
+        tokens.push(t);
+    }
+    tokens
+}
+
 #[tokio::test]
 async fn streams_tokens_in_order() {
     let server = MockServer::start().await;
@@ -49,12 +58,15 @@ async fn streams_tokens_in_order() {
     let client = reqwest::Client::new();
     let cfg = cfg(&server, "test-model");
     let messages = vec![Message::user("hi")];
-    let mut sink = String::new();
-    let outcome = run_stream(&client, &cfg, &messages, &mut sink, std::future::pending::<()>())
+    let (tx, rx) = mpsc::channel(64);
+    let drain = tokio::spawn(collect(rx));
+    let outcome = run_stream(&client, &cfg, &messages, tx, std::future::pending::<()>())
         .await
         .expect("stream ok");
     assert_eq!(outcome, StreamOutcome::Done);
-    assert_eq!(sink, "hello world");
+    let tokens = drain.await.unwrap();
+    assert_eq!(tokens, vec!["hel", "lo", " world"]);
+    assert_eq!(tokens.concat(), "hello world");
 }
 
 #[tokio::test]
@@ -71,10 +83,12 @@ async fn http_401_surfaces_status_and_body() {
     let client = reqwest::Client::new();
     let cfg = cfg(&server, "test-model");
     let messages = vec![Message::user("hi")];
-    let mut sink = String::new();
-    let err = run_stream(&client, &cfg, &messages, &mut sink, std::future::pending::<()>())
+    let (tx, rx) = mpsc::channel(64);
+    let drain = tokio::spawn(collect(rx));
+    let err = run_stream(&client, &cfg, &messages, tx, std::future::pending::<()>())
         .await
         .unwrap_err();
+    drain.abort();
     let s = format!("{err:#}");
     assert!(s.contains("401"), "missing status in: {s}");
     assert!(s.contains("bad key"), "missing body in: {s}");
@@ -97,13 +111,15 @@ async fn cancel_aborts_mid_stream() {
     let client = reqwest::Client::new();
     let cfg = cfg(&server, "test-model");
     let messages = vec![Message::user("hi")];
-    let mut sink = String::new();
+    let (tx, rx) = mpsc::channel(64);
+    let drain = tokio::spawn(collect(rx));
     let cancel = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let outcome = run_stream(&client, &cfg, &messages, &mut sink, cancel)
+    let outcome = run_stream(&client, &cfg, &messages, tx, cancel)
         .await
         .expect("stream ok");
     assert_eq!(outcome, StreamOutcome::Cancelled);
-    assert!(sink.is_empty());
+    let tokens = drain.await.unwrap();
+    assert!(tokens.is_empty(), "got tokens during cancel: {tokens:?}");
 }

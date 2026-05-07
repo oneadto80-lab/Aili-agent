@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
 use std::future::Future;
-use tokio::io::{AsyncWriteExt, stdout};
+use tokio::sync::mpsc;
 
 use crate::chat::{ChatRequest, Message, StreamChunk};
 use crate::config::ResolvedConfig;
@@ -15,9 +15,15 @@ pub enum StreamOutcome {
     Cancelled,
 }
 
-/// POST a streaming chat completion. Writes raw token deltas to stdout as they
-/// arrive, and appends the full text into `sink` so the caller can keep
-/// conversation context in REPL mode.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    Token(String),
+}
+
+/// POST a streaming chat completion. Token deltas are delivered through `tx`
+/// as they arrive; the function returns once the stream finishes, is
+/// cancelled, or errors. The receiver decides what to do with each token
+/// (write to stdout, append to a TUI widget, etc).
 ///
 /// `cancel` is awaited concurrently with the event stream; if it resolves
 /// first, we abort and return `Cancelled`.
@@ -25,7 +31,7 @@ pub async fn run_stream(
     client: &reqwest::Client,
     cfg: &ResolvedConfig,
     messages: &[Message],
-    sink: &mut String,
+    tx: mpsc::Sender<StreamEvent>,
     cancel: impl Future<Output = ()>,
 ) -> Result<StreamOutcome> {
     let url = format!("{}/chat/completions", cfg.base_url);
@@ -39,21 +45,15 @@ pub async fn run_stream(
     let mut es = EventSource::new(req).context("failed to start SSE request")?;
     tokio::pin!(cancel);
 
-    let mut out = stdout();
-
     loop {
         tokio::select! {
             biased;
             _ = &mut cancel => {
                 es.close();
-                out.write_all(b"\n").await.ok();
-                out.flush().await.ok();
                 return Ok(StreamOutcome::Cancelled);
             }
             ev = es.next() => {
                 let Some(ev) = ev else {
-                    out.write_all(b"\n").await.ok();
-                    out.flush().await.ok();
                     return Ok(StreamOutcome::Done);
                 };
                 match ev {
@@ -61,8 +61,6 @@ pub async fn run_stream(
                     Ok(Event::Message(m)) => {
                         if m.data.trim() == "[DONE]" {
                             es.close();
-                            out.write_all(b"\n").await.ok();
-                            out.flush().await.ok();
                             return Ok(StreamOutcome::Done);
                         }
                         let chunk: StreamChunk = match serde_json::from_str(&m.data) {
@@ -73,15 +71,14 @@ pub async fn run_stream(
                         };
                         for choice in &chunk.choices {
                             if let Some(text) = &choice.delta.content {
-                                sink.push_str(text);
-                                out.write_all(text.as_bytes()).await.ok();
-                                out.flush().await.ok();
+                                if tx.send(StreamEvent::Token(text.clone())).await.is_err() {
+                                    es.close();
+                                    return Ok(StreamOutcome::Cancelled);
+                                }
                             }
                         }
                     }
                     Err(reqwest_eventsource::Error::StreamEnded) => {
-                        out.write_all(b"\n").await.ok();
-                        out.flush().await.ok();
                         return Ok(StreamOutcome::Done);
                     }
                     Err(e) => {

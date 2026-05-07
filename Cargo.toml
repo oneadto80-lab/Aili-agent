@@ -14,6 +14,10 @@ clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
 anyhow = "1"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }
+tui-textarea = "0.7"
+textwrap = "0.16"
 
 [dev-dependencies]
 wiremock = "0.6"
