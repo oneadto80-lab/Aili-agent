@@ -3,18 +3,17 @@ mod render;
 mod stream_state;
 
 use anyhow::{Context, Result};
+use crossterm::cursor::MoveTo;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event as CtEvent, EventStream, KeyEvent,
     KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use futures_util::StreamExt;
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::Block;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::io::{Stdout, stdout};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -28,6 +27,7 @@ use self::keymap::{Action, KeyContext};
 use self::stream_state::StreamState;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+const INLINE_HEIGHT: u16 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
@@ -49,6 +49,8 @@ pub(crate) enum AppEvent {
 pub(crate) struct InFlight {
     token_rx: mpsc::Receiver<StreamEvent>,
     cancel_tx: Option<oneshot::Sender<()>>,
+    pub started: Instant,
+    pub chars: usize,
 }
 
 pub(crate) struct CtrlCArm {
@@ -66,13 +68,20 @@ fn setup_terminal() -> Result<Term> {
     enable_raw_mode().context("enable raw mode")?;
     execute!(
         stdout(),
-        EnterAlternateScreen,
         Clear(ClearType::All),
+        Clear(ClearType::Purge),
+        MoveTo(0, 0),
         EnableBracketedPaste
     )
-    .context("enter fullscreen terminal")?;
+    .context("prepare terminal screen")?;
     let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend).context("init terminal")?;
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(INLINE_HEIGHT),
+        },
+    )
+    .context("init inline terminal")?;
     terminal.clear().ok();
     terminal.hide_cursor().ok();
     Ok(terminal)
@@ -80,15 +89,10 @@ fn setup_terminal() -> Result<Term> {
 
 fn restore_terminal(term: &mut Term) -> Result<()> {
     term.clear().ok();
-    execute!(
-        term.backend_mut(),
-        DisableBracketedPaste,
-        Clear(ClearType::All),
-        LeaveAlternateScreen
-    )
-    .ok();
-    disable_raw_mode().ok();
+    execute!(term.backend_mut(), DisableBracketedPaste).ok();
     term.show_cursor().ok();
+    disable_raw_mode().ok();
+    println!();
     Ok(())
 }
 
@@ -105,6 +109,7 @@ pub(crate) struct App {
     pub ctrl_c_arm: Option<CtrlCArm>,
     pub status_msg: Option<(String, Instant)>,
     pub submit_pending: bool,
+    welcome_done: bool,
 }
 
 impl App {
@@ -123,32 +128,37 @@ impl App {
             ctrl_c_arm: None,
             status_msg: None,
             submit_pending: false,
+            welcome_done: false,
         }
     }
 
     async fn run(mut self, term: &mut Term) -> Result<()> {
+        self.write_welcome(term)?;
         let mut events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(50));
 
         loop {
-            self.flush_stream()?;
+            self.flush_stream(term)?;
             self.expire_timed();
-            term.draw(|f| render::draw_fullscreen(&self, f))?;
+            term.draw(|f| render::draw_inline(&self, f))?;
             if self.quit {
                 break;
             }
             tokio::select! {
                 biased;
                 Some(app_ev) = self.app_rx.recv() => {
-                    self.on_app_event(app_ev)?;
+                    self.on_app_event(app_ev, term)?;
                 }
                 Some(ev) = events.next() => {
                     match ev {
-                        Ok(ev) => self.on_terminal_event(ev),
+                        Ok(ev) => self.on_terminal_event(ev, term)?,
                         Err(e) => self.flash(format!("input error: {e}")),
                     }
                 }
                 Some(StreamEvent::Token(t)) = recv_stream(&mut self.in_flight) => {
+                    if let Some(f) = self.in_flight.as_mut() {
+                        f.chars += t.chars().count();
+                    }
                     self.stream.enqueue(t);
                 }
                 _ = tick.tick() => {}
@@ -157,29 +167,78 @@ impl App {
         Ok(())
     }
 
-    fn on_app_event(&mut self, ev: AppEvent) -> Result<()> {
+    fn write_welcome(&mut self, term: &mut Term) -> Result<()> {
+        if self.welcome_done {
+            return Ok(());
+        }
+        let width = term_width(term);
+        let lines = render::welcome_page_lines(self, width);
+        insert_history_lines(term, lines)?;
+        self.welcome_done = true;
+        Ok(())
+    }
+
+    fn write_user_to_scrollback(&mut self, term: &mut Term, text: &str) -> Result<()> {
+        let width = term_width(term);
+        let lines = render::user_message_lines(&self.cfg.persona.user_name, text, width);
+        insert_history_lines(term, lines)
+    }
+
+    fn write_assistant_to_scrollback(&mut self, term: &mut Term, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let width = term_width(term);
+        let lines = render::assistant_message_lines(&self.cfg.persona.assistant_name, text, width);
+        insert_history_lines(term, lines)
+    }
+
+    fn write_note_to_scrollback(&mut self, term: &mut Term, note: &str) -> Result<()> {
+        insert_history_lines(term, render::note_lines(note))
+    }
+
+    fn clear_terminal_ui(&mut self, term: &mut Term) -> Result<()> {
+        execute!(
+            term.backend_mut(),
+            Clear(ClearType::All),
+            Clear(ClearType::Purge)
+        )
+        .ok();
+        term.clear().ok();
+        self.history.clear();
+        self.stream.drain_all();
+        self.welcome_done = false;
+        self.write_welcome(term)
+    }
+
+    fn on_app_event(&mut self, ev: AppEvent, term: &mut Term) -> Result<()> {
         match ev {
             AppEvent::StreamFinished(res) => {
                 self.drain_in_flight_tokens();
                 let final_pending = self.stream.drain_all();
                 self.append_assistant_text(&final_pending);
-                self.in_flight = None;
+                let assistant_text = self
+                    .history
+                    .last()
+                    .filter(|m| m.role == Role::Assistant)
+                    .map(|m| m.text.clone())
+                    .unwrap_or_default();
                 match res {
-                    Ok(StreamOutcome::Done) => {}
-                    Ok(StreamOutcome::Cancelled) => self.append_assistant_text("\n(cancelled)"),
+                    Ok(StreamOutcome::Done) => {
+                        self.write_assistant_to_scrollback(term, &assistant_text)?;
+                    }
+                    Ok(StreamOutcome::Cancelled) => {
+                        self.write_assistant_to_scrollback(term, &assistant_text)?;
+                        self.write_note_to_scrollback(term, "(cancelled)")?;
+                    }
                     Err(e) => {
-                        if matches!(
-                            self.history.last(),
-                            Some(m) if m.role == Role::Assistant && m.text.is_empty()
-                        ) {
-                            self.history.pop();
+                        if !assistant_text.is_empty() {
+                            self.write_assistant_to_scrollback(term, &assistant_text)?;
                         }
-                        self.history.push(UiMessage {
-                            role: Role::Assistant,
-                            text: format!("error: {e:#}"),
-                        });
+                        self.write_note_to_scrollback(term, &format!("error: {e:#}"))?;
                     }
                 }
+                self.in_flight = None;
                 if matches!(
                     self.history.last(),
                     Some(m) if m.role == Role::Assistant && m.text.is_empty()
@@ -191,7 +250,7 @@ impl App {
         Ok(())
     }
 
-    fn on_terminal_event(&mut self, ev: CtEvent) {
+    fn on_terminal_event(&mut self, ev: CtEvent, term: &mut Term) -> Result<()> {
         match ev {
             CtEvent::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k),
             CtEvent::Paste(p) => {
@@ -204,8 +263,10 @@ impl App {
                     });
                 }
             }
+            CtEvent::Resize(_, _) => self.rewrite_scrollback(term)?,
             _ => {}
         }
+        Ok(())
     }
 
     fn on_key(&mut self, k: KeyEvent) {
@@ -262,6 +323,7 @@ impl App {
     fn drain_in_flight_tokens(&mut self) {
         if let Some(f) = self.in_flight.as_mut() {
             while let Ok(StreamEvent::Token(t)) = f.token_rx.try_recv() {
+                f.chars += t.chars().count();
                 self.stream.enqueue(t);
             }
         }
@@ -283,7 +345,7 @@ impl App {
         });
     }
 
-    fn submit(&mut self) -> Result<()> {
+    fn submit(&mut self, term: &mut Term) -> Result<()> {
         if self.in_flight.is_some() {
             return Ok(());
         }
@@ -295,10 +357,11 @@ impl App {
         self.composer = fresh_composer();
 
         if let Some(rest) = text.strip_prefix('/') {
-            self.handle_slash(rest);
+            self.handle_slash(rest, term)?;
             return Ok(());
         }
 
+        self.write_user_to_scrollback(term, &text)?;
         self.history.push(UiMessage {
             role: Role::User,
             text: text.clone(),
@@ -337,17 +400,21 @@ impl App {
         self.in_flight = Some(InFlight {
             token_rx,
             cancel_tx: Some(cancel_tx),
+            started: Instant::now(),
+            chars: 0,
         });
         Ok(())
     }
 
-    fn handle_slash(&mut self, rest: &str) {
+    fn handle_slash(&mut self, rest: &str, term: &mut Term) -> Result<()> {
         let mut parts = rest.split_whitespace();
-        let Some(cmd) = parts.next() else { return };
+        let Some(cmd) = parts.next() else {
+            return Ok(());
+        };
         match cmd {
             "exit" | "quit" => self.quit = true,
             "clear" => {
-                self.history.clear();
+                self.clear_terminal_ui(term)?;
                 self.flash("(history cleared)".to_string());
             }
             "model" => match parts.next() {
@@ -369,16 +436,17 @@ impl App {
             "help" => self.flash("/model [name] /provider /params /clear /exit".to_string()),
             other => self.flash(format!("unknown command: /{other} (try /help)")),
         }
+        Ok(())
     }
 
-    fn flush_stream(&mut self) -> Result<()> {
+    fn flush_stream(&mut self, term: &mut Term) -> Result<()> {
         if self.stream.ready() {
             let chunk = self.stream.drain_pending();
             self.append_assistant_text(&chunk);
         }
         if self.submit_pending {
             self.submit_pending = false;
-            self.submit()?;
+            self.submit(term)?;
         }
         Ok(())
     }
@@ -399,6 +467,54 @@ impl App {
     fn flash(&mut self, msg: String) {
         self.status_msg = Some((msg, Instant::now()));
     }
+
+    fn rewrite_scrollback(&mut self, term: &mut Term) -> Result<()> {
+        self.drain_in_flight_tokens();
+        let pending = self.stream.drain_all();
+        self.append_assistant_text(&pending);
+
+        execute!(
+            term.backend_mut(),
+            Clear(ClearType::All),
+            Clear(ClearType::Purge),
+            MoveTo(0, 0)
+        )
+        .ok();
+        term.clear().ok();
+
+        self.welcome_done = false;
+        self.write_welcome(term)?;
+        for msg in self.replayable_history() {
+            match msg.role {
+                Role::User => self.write_user_to_scrollback(term, &msg.text)?,
+                Role::Assistant => self.write_assistant_to_scrollback(term, &msg.text)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn replayable_history(&self) -> Vec<UiMessage> {
+        let mut history = self.history.clone();
+        if self.in_flight.is_some()
+            && matches!(history.last(), Some(m) if m.role == Role::Assistant)
+        {
+            history.pop();
+        }
+        history
+    }
+}
+
+fn term_width(term: &mut Term) -> usize {
+    term.size().map(|r| r.width as usize).unwrap_or(80).max(1)
+}
+
+fn insert_history_lines(term: &mut Term, lines: Vec<ratatui::text::Line<'static>>) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let height = lines.len() as u16;
+    term.insert_before(height, move |buf| render::paint_lines(buf, lines))
+        .context("insert terminal history")
 }
 
 fn fresh_composer() -> TextArea<'static> {
@@ -436,5 +552,77 @@ fn ct_to_input(k: &KeyEvent) -> Input {
         ctrl: k.modifiers.contains(KeyModifiers::CONTROL),
         alt: k.modifiers.contains(KeyModifiers::ALT),
         shift: k.modifiers.contains(KeyModifiers::SHIFT),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AltScreenMode, Persona, TuiConfig};
+    use crate::provider::Provider;
+
+    fn test_cfg() -> ResolvedConfig {
+        ResolvedConfig {
+            provider: Provider::DeepSeek,
+            base_url: "https://example.test/v1".into(),
+            api_key: "test-key".into(),
+            model: "deepseek-v4-flash".into(),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: Vec::new(),
+            persona: Persona {
+                user_name: "Rose".into(),
+                assistant_name: "Aili".into(),
+                description: String::new(),
+            },
+            tui: TuiConfig {
+                alternate_screen: AltScreenMode::Never,
+            },
+        }
+    }
+
+    #[test]
+    fn replayable_history_keeps_finalized_messages() {
+        let mut app = App::new(test_cfg(), reqwest::Client::new());
+        app.history.push(UiMessage {
+            role: Role::User,
+            text: "hello".into(),
+        });
+        app.history.push(UiMessage {
+            role: Role::Assistant,
+            text: "hi".into(),
+        });
+
+        let replayable = app.replayable_history();
+
+        assert_eq!(replayable.len(), 2);
+        assert_eq!(replayable[1].text, "hi");
+    }
+
+    #[test]
+    fn replayable_history_skips_streaming_assistant_tail() {
+        let mut app = App::new(test_cfg(), reqwest::Client::new());
+        app.history.push(UiMessage {
+            role: Role::User,
+            text: "hello".into(),
+        });
+        app.history.push(UiMessage {
+            role: Role::Assistant,
+            text: "partial".into(),
+        });
+        let (_token_tx, token_rx) = mpsc::channel::<StreamEvent>(1);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        app.in_flight = Some(InFlight {
+            token_rx,
+            cancel_tx: Some(cancel_tx),
+            started: Instant::now(),
+            chars: 0,
+        });
+
+        let replayable = app.replayable_history();
+
+        assert_eq!(replayable.len(), 1);
+        assert_eq!(replayable[0].role, Role::User);
     }
 }

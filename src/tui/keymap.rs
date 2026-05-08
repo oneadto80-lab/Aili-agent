@@ -16,8 +16,8 @@ pub enum KeyContext {
 /// itself so that future configurable keymaps can swap the resolver without
 /// touching the App loop.
 ///
-/// Note: scrolling actions are intentionally absent for now. The fullscreen
-/// renderer keeps the current visible transcript in app state.
+/// Note: scrolling actions are intentionally absent in the main chat. Finalized
+/// history is written to terminal scrollback, so the terminal owns review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Submit,

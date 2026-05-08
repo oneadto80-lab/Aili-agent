@@ -11,6 +11,9 @@ use tokio::sync::mpsc;
 #[derive(Parser, Debug)]
 #[command(name = "aili", version, about = "Memory-first companion agent")]
 struct Cli {
+    /// Disable alternate screen overlays and keep terminal scrollback available.
+    #[arg(long, global = true)]
+    no_alt_screen: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -50,6 +53,7 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let no_alt_screen = cli.no_alt_screen;
     match cli.cmd {
         Some(Cmd::Config { action }) => match action {
             ConfigAction::Init => {
@@ -82,7 +86,10 @@ async fn run(cli: Cli) -> Result<()> {
             probe_local(&client, &cfg).await?;
             match once {
                 Some(prompt) => once_turn(&client, &cfg, prompt).await,
-                None => aili::tui::run(cfg, client).await,
+                None => {
+                    let _ = no_alt_screen;
+                    aili::tui::run(cfg, client).await
+                }
             }
         }
         None => {
@@ -100,6 +107,7 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let client = build_client()?;
             probe_local(&client, &cfg).await?;
+            let _ = no_alt_screen;
             aili::tui::run(cfg, client).await
         }
     }

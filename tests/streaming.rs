@@ -1,5 +1,5 @@
 use aili::chat::Message;
-use aili::config::{Persona, ResolvedConfig};
+use aili::config::{Persona, ResolvedConfig, TuiConfig};
 use aili::provider::Provider;
 use aili::stream::{StreamEvent, StreamOutcome, run_stream};
 use std::time::Duration;
@@ -18,6 +18,7 @@ fn cfg(server: &MockServer, model: &str) -> ResolvedConfig {
         max_tokens: None,
         stop: vec![],
         persona: Persona::default(),
+        tui: TuiConfig::default(),
     }
 }
 
@@ -109,6 +110,7 @@ fn cfg_for(server: &MockServer, provider: Provider, model: &str) -> ResolvedConf
         max_tokens: Some(256),
         stop: vec![],
         persona: Persona::default(),
+        tui: TuiConfig::default(),
     }
 }
 

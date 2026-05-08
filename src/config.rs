@@ -17,6 +17,8 @@ pub struct RawConfig {
     pub persona: Option<PersonaSection>,
     #[serde(default)]
     pub sampling: Option<SamplingSection>,
+    #[serde(default)]
+    pub tui: Option<TuiSection>,
 
     // Legacy flat fields (v0.1 / v0.2). Loader migrates these into Core.
     #[serde(default)]
@@ -65,6 +67,20 @@ pub struct SamplingSection {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TuiSection {
+    pub alternate_screen: Option<AltScreenMode>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AltScreenMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SecretsFile {
     #[serde(default)]
     keys: HashMap<String, String>,
@@ -83,6 +99,7 @@ pub struct ResolvedConfig {
     pub max_tokens: Option<u32>,
     pub stop: Vec<String>,
     pub persona: Persona,
+    pub tui: TuiConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +108,19 @@ pub struct Persona {
     pub assistant_name: String,
     #[allow(dead_code)]
     pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TuiConfig {
+    pub alternate_screen: AltScreenMode,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            alternate_screen: AltScreenMode::Auto,
+        }
+    }
 }
 
 impl Default for Persona {
@@ -212,6 +242,10 @@ pub fn resolve(raw: RawConfig) -> Result<ResolvedConfig> {
             .unwrap_or_else(|| "Aili".into()),
         description: persona_section.description,
     };
+    let tui_section = raw.tui.unwrap_or_default();
+    let tui = TuiConfig {
+        alternate_screen: tui_section.alternate_screen.unwrap_or_default(),
+    };
 
     Ok(ResolvedConfig {
         provider,
@@ -223,6 +257,7 @@ pub fn resolve(raw: RawConfig) -> Result<ResolvedConfig> {
         max_tokens,
         stop,
         persona,
+        tui,
     })
 }
 
@@ -297,6 +332,11 @@ description    = ""
 # temperature = 0.7
 # top_p       = 1.0
 # max_tokens  = 4096
+
+[tui]
+# Aili's main chat uses inline terminal scrollback by default.
+# `always` is reserved for future fullscreen overlays.
+alternate_screen = "auto"
 "#;
 
 pub fn write_template(path: &Path) -> Result<()> {
@@ -345,7 +385,10 @@ pub fn write_wizard_result(
          [sampling]\n\
          # temperature = 0.7\n\
          # top_p       = 1.0\n\
-         # max_tokens  = 4096\n",
+         # max_tokens  = 4096\n\
+         \n\
+         [tui]\n\
+         alternate_screen = \"auto\"\n",
         user = escape_toml_string(user_name),
     ));
     let cfg_path = config_path()?;
@@ -484,6 +527,7 @@ mod tests {
         assert_eq!(r.api_key, "sk-test-legacy");
         assert_eq!(r.persona.user_name, "you");
         assert_eq!(r.persona.assistant_name, "Aili");
+        assert_eq!(r.tui.alternate_screen, AltScreenMode::Auto);
     }
 
     #[test]
@@ -509,6 +553,26 @@ mod tests {
         assert_eq!(r.model, "deepseek-v4-pro");
         assert_eq!(r.persona.user_name, "rose");
         assert_eq!(r.persona.description, "concise");
+        assert_eq!(r.tui.alternate_screen, AltScreenMode::Auto);
+    }
+
+    #[test]
+    fn tui_alternate_screen_resolves() {
+        unsafe { std::env::set_var("AILI_TEST_TUI_KEY", "sk-test-tui") };
+        let raw = RawConfig {
+            core: Some(CoreSection {
+                provider: Some("deepseek".into()),
+                api_key_env: Some("AILI_TEST_TUI_KEY".into()),
+                initialized: true,
+                ..Default::default()
+            }),
+            tui: Some(TuiSection {
+                alternate_screen: Some(AltScreenMode::Never),
+            }),
+            ..Default::default()
+        };
+        let r = resolve(raw).unwrap();
+        assert_eq!(r.tui.alternate_screen, AltScreenMode::Never);
     }
 
     #[test]

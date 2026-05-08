@@ -1,13 +1,13 @@
 use ratatui::Frame;
-#[cfg(test)]
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{App, Role};
+use crate::logo;
 
 fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
     if text.is_empty() {
@@ -57,7 +57,7 @@ fn wrap_text_block(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-pub fn draw_fullscreen(app: &App, f: &mut Frame) {
+pub fn draw_inline(app: &App, f: &mut Frame) {
     let area = f.area();
     f.render_widget(
         Block::default().style(Style::default().bg(Color::Reset)),
@@ -65,10 +65,12 @@ pub fn draw_fullscreen(app: &App, f: &mut Frame) {
     );
 
     let composer_lines = (app.composer.lines().len() as u16).clamp(1, 3);
+    let spinner_h: u16 = if app.in_flight.is_some() { 1 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
+            Constraint::Length(spinner_h),
             Constraint::Length(1),
             Constraint::Length(composer_lines),
             Constraint::Length(1),
@@ -76,34 +78,137 @@ pub fn draw_fullscreen(app: &App, f: &mut Frame) {
         .split(area);
 
     f.render_widget(
-        history_view(app, chunks[0].width as usize, chunks[0].height as usize),
+        live_view(app, chunks[0].width as usize, chunks[0].height as usize),
         chunks[0],
     );
-    f.render_widget(divider(), chunks[1]);
+    if spinner_h > 0 {
+        f.render_widget(spinner_line(app), chunks[1]);
+    }
+    f.render_widget(divider(), chunks[2]);
 
     let input_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(chunks[2]);
+        .split(chunks[3]);
     f.render_widget(input_prompt(), input_chunks[0]);
     f.render_widget(&app.composer, input_chunks[1]);
-    f.render_widget(status_line(app), chunks[3]);
+    f.render_widget(status_line(app, chunks[4].width as usize), chunks[4]);
 }
 
-fn history_view(app: &App, width: usize, height: usize) -> Paragraph<'static> {
-    let mut lines = if app.history.is_empty() {
-        welcome_lines(app)
-    } else {
-        conversation_lines(app, width)
+fn spinner_line(app: &App) -> Paragraph<'static> {
+    let Some(f) = app.in_flight.as_ref() else {
+        return Paragraph::new(Line::raw(""));
     };
-    lines = trim_to_visible(lines, height);
-    Paragraph::new(lines).alignment(Alignment::Left)
+    const FRAMES: [&str; 6] = ["✶", "✸", "✹", "✺", "✹", "✸"];
+    let elapsed = f.started.elapsed();
+    let frame_idx = (elapsed.as_millis() / 80) as usize % FRAMES.len();
+    let secs = elapsed.as_secs();
+    let mins = secs / 60;
+    let time_str = if mins > 0 {
+        format!("{}m {:02}s", mins, secs % 60)
+    } else {
+        format!("{}s", secs)
+    };
+    let kilo = f.chars as f64 / 4.0 / 1000.0;
+    let brand = Color::LightCyan;
+    Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("{} ", FRAMES[frame_idx]),
+            Style::default().fg(brand),
+        ),
+        Span::styled("Calculating…", Style::default().fg(brand)),
+        Span::styled(
+            format!(" ({} · ↓ {:.1}k tokens)", time_str, kilo),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
 }
 
-fn welcome_lines(app: &App) -> Vec<Line<'static>> {
-    let cwd = pretty_cwd();
-    vec![
-        Line::raw(""),
+fn live_view(app: &App, width: usize, height: usize) -> Paragraph<'static> {
+    let lines = if app.in_flight.is_some() {
+        app.history
+            .last()
+            .filter(|m| m.role == Role::Assistant && !m.text.is_empty())
+            .map(|m| assistant_message_lines(&app.cfg.persona.assistant_name, &m.text, width))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Paragraph::new(trim_to_visible(lines, height)).alignment(Alignment::Left)
+}
+
+/// Full welcome page: block-art logo on the left, centered vertically next to
+/// the text content, all wrapped in a single border.
+pub fn welcome_page_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let logo_lines: Vec<&'static str> = logo::lines().collect();
+    let logo_w = logo_lines
+        .iter()
+        .map(|s| UnicodeWidthStr::width(*s))
+        .max()
+        .unwrap_or(0);
+    let gap = 3usize;
+    let inner_width = width.saturating_sub(4);
+    let min_text_width = 18usize;
+
+    let text_col_width = if inner_width >= logo_w + gap + min_text_width {
+        inner_width.saturating_sub(logo_w + gap).min(72)
+    } else {
+        return welcome_card_lines(app, width);
+    };
+
+    let text_content = welcome_card_content(app, text_col_width);
+    let max_rows = text_content.len().max(logo_lines.len());
+    let logo_start = centered_logo_start(&text_content, logo_lines.len(), max_rows);
+    let text_lines: Vec<Line<'static>> = text_content
+        .iter()
+        .map(|line| center_line_to_width(line, text_col_width))
+        .collect();
+    let mut combined: Vec<Line<'static>> = Vec::with_capacity(max_rows);
+    let gap_span = Span::raw(" ".repeat(gap));
+    let logo_style = Style::default().fg(Color::DarkGray);
+
+    for i in 0..max_rows {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+
+        if i >= logo_start && i < logo_start + logo_lines.len() {
+            let s = logo_lines[i - logo_start];
+            let used = UnicodeWidthStr::width(s);
+            let left_pad = logo_w.saturating_sub(used) / 2;
+            let right_pad = logo_w.saturating_sub(used + left_pad);
+            if left_pad > 0 {
+                spans.push(Span::raw(" ".repeat(left_pad)));
+            }
+            spans.push(Span::styled(s.to_string(), logo_style));
+            if right_pad > 0 {
+                spans.push(Span::raw(" ".repeat(right_pad)));
+            }
+        } else {
+            spans.push(Span::raw(" ".repeat(logo_w)));
+        }
+
+        spans.push(gap_span.clone());
+
+        if i < text_lines.len() {
+            let line = &text_lines[i];
+            let used = line_width(line);
+            spans.extend(line.spans.iter().cloned());
+            if used < text_col_width {
+                spans.push(Span::raw(" ".repeat(text_col_width - used)));
+            }
+        } else {
+            spans.push(Span::raw(" ".repeat(text_col_width)));
+        }
+
+        combined.push(Line::from(spans));
+    }
+
+    with_border_fit(combined, width)
+}
+
+fn welcome_card_content(app: &App, width: usize) -> Vec<Line<'static>> {
+    let content_width = width.max(1).min(72);
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 "Aili",
@@ -117,61 +222,258 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
             ),
         ]),
         Line::raw(""),
+    ];
+    for line in wrap_text_block(
+        &format!("Welcome back, {}!", app.cfg.persona.user_name),
+        content_width,
+    ) {
+        lines.push(Line::from(Span::styled(
+            line,
+            Style::default().fg(Color::White),
+        )));
+    }
+    lines.push(Line::raw(""));
+    for line in wrap_text_block(
+        &format!("{} · {}", app.cfg.model, app.cfg.provider.as_str()),
+        content_width,
+    ) {
+        lines.push(Line::from(Span::styled(
+            line,
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    for line in wrap_text_block(&pretty_cwd(), content_width) {
+        lines.push(Line::from(Span::styled(
+            line,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
+fn center_line_to_width(line: &Line<'_>, width: usize) -> Line<'static> {
+    let used = line_width(line);
+    if used >= width {
+        return owned_line(line);
+    }
+
+    let left_pad = (width - used) / 2;
+    let right_pad = width - used - left_pad;
+    let mut spans = Vec::with_capacity(line.spans.len() + 2);
+    if left_pad > 0 {
+        spans.push(Span::raw(" ".repeat(left_pad)));
+    }
+    spans.extend(owned_line(line).spans);
+    if right_pad > 0 {
+        spans.push(Span::raw(" ".repeat(right_pad)));
+    }
+    Line::from(spans)
+}
+
+fn owned_line(line: &Line<'_>) -> Line<'static> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .iter()
+            .map(|span| Span::styled(span.content.to_string(), span.style))
+            .collect(),
+    }
+}
+
+fn centered_logo_start(
+    text_lines: &[Line<'_>],
+    logo_line_count: usize,
+    total_rows: usize,
+) -> usize {
+    if logo_line_count == 0 || total_rows == 0 {
+        return 0;
+    }
+
+    let visible_rows: Vec<usize> = text_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| (line_width(line) > 0).then_some(idx))
+        .collect();
+
+    let center_row = match (visible_rows.first(), visible_rows.last()) {
+        (Some(first), Some(last)) => (first + last) / 2,
+        _ => total_rows / 2,
+    };
+
+    center_row
+        .saturating_sub(logo_line_count / 2)
+        .min(total_rows.saturating_sub(logo_line_count))
+}
+
+pub fn welcome_card_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let content_width = width.saturating_sub(4).max(1);
+    with_border_fit(welcome_card_content(app, content_width), width)
+}
+
+/// "{user_name}\n<wrapped text>\n" formatted for terminal scrollback.
+pub fn user_message_lines(user_name: &str, text: &str, width: usize) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        user_name.to_string(),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for v in wrap_text_block(text, width) {
+        out.push(Line::raw(v));
+    }
+    out.push(Line::raw(""));
+    out
+}
+
+pub fn assistant_message_lines(
+    assistant_name: &str,
+    text: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        assistant_name.to_string(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for v in wrap_text_block(text, width) {
+        out.push(Line::raw(v));
+    }
+    out.push(Line::raw(""));
+    out
+}
+
+pub fn note_lines(note: &str) -> Vec<Line<'static>> {
+    vec![
         Line::from(vec![
-            Span::styled("Welcome back, ", Style::default().fg(Color::White)),
-            Span::styled(
-                app.cfg.persona.user_name.clone(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("!", Style::default().fg(Color::White)),
+            Span::styled("· ", Style::default().fg(Color::DarkGray)),
+            Span::styled(note.to_string(), Style::default().fg(Color::DarkGray)),
         ]),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled(
-                app.cfg.model.clone(),
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.cfg.provider.as_str().to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(Span::styled(cwd, Style::default().fg(Color::DarkGray))),
     ]
 }
 
-fn conversation_lines(app: &App, width: usize) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    for msg in &app.history {
-        match msg.role {
-            Role::User => {
-                out.push(Line::from(Span::styled(
-                    app.cfg.persona.user_name.clone(),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                )));
-            }
-            Role::Assistant => {
-                out.push(Line::from(Span::styled(
-                    "Aili",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )));
-            }
+#[cfg(test)]
+fn with_border(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let content_width = lines.iter().map(line_width).max().unwrap_or(0);
+    let border_inner_width = content_width + 2;
+    let mut out = Vec::with_capacity(lines.len() + 2);
+    out.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(border_inner_width)),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    for line in lines {
+        let used_width = line_width(&line);
+        let mut spans = Vec::with_capacity(line.spans.len() + 3);
+        spans.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+        spans.extend(line.spans);
+        if used_width < content_width {
+            spans.push(Span::styled(
+                " ".repeat(content_width - used_width),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
-        for v in wrap_text_block(&msg.text, width) {
-            out.push(Line::raw(v));
-        }
-        out.push(Line::raw(""));
+        spans.push(Span::styled(" │", Style::default().fg(Color::DarkGray)));
+        out.push(Line::from(spans));
     }
+
+    out.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(border_inner_width)),
+        Style::default().fg(Color::DarkGray),
+    )));
     out
+}
+
+fn with_border_fit(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    if width < 4 {
+        return lines
+            .iter()
+            .map(|line| fit_line_to_width(line, width))
+            .collect();
+    }
+
+    let max_content_width = width - 4;
+    let content_width = lines
+        .iter()
+        .map(line_width)
+        .max()
+        .unwrap_or(0)
+        .min(max_content_width);
+    let border_inner_width = content_width + 2;
+    let border_style = Style::default().fg(Color::DarkGray);
+    let mut out = Vec::with_capacity(lines.len() + 2);
+    out.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(border_inner_width)),
+        border_style,
+    )));
+
+    for line in lines {
+        let fitted = fit_line_to_width(&line, content_width);
+        let used_width = line_width(&fitted);
+        let mut spans = Vec::with_capacity(fitted.spans.len() + 3);
+        spans.push(Span::styled("│ ", border_style));
+        spans.extend(fitted.spans);
+        if used_width < content_width {
+            spans.push(Span::styled(
+                " ".repeat(content_width - used_width),
+                border_style,
+            ));
+        }
+        spans.push(Span::styled(" │", border_style));
+        out.push(Line::from(spans));
+    }
+
+    out.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(border_inner_width)),
+        border_style,
+    )));
+    out
+}
+
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
+fn fit_line_to_width(line: &Line<'_>, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::raw("");
+    }
+    let mut used = 0usize;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        let mut content = String::new();
+        for ch in span.content.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            let ch_width = char_width(ch);
+            if ch_width == 0 {
+                continue;
+            }
+            if used + ch_width > width {
+                if !content.is_empty() {
+                    spans.push(Span::styled(content, span.style));
+                }
+                return Line::from(spans);
+            }
+            content.push(ch);
+            used += ch_width;
+        }
+        if !content.is_empty() {
+            spans.push(Span::styled(content, span.style));
+        }
+    }
+    Line::from(spans)
 }
 
 fn trim_to_visible(lines: Vec<Line<'static>>, max_len: usize) -> Vec<Line<'static>> {
@@ -198,14 +500,47 @@ fn input_prompt() -> Paragraph<'static> {
     )))
 }
 
-fn status_line(app: &App) -> Paragraph<'static> {
+fn status_line(app: &App, width: usize) -> Paragraph<'static> {
     if let Some((msg, _)) = &app.status_msg {
         return Paragraph::new(Line::from(Span::styled(
-            msg.clone(),
+            fit_text_to_width(msg, width),
             Style::default().fg(Color::Yellow),
         )));
     }
-    Paragraph::new(Line::raw(""))
+    Paragraph::new(Line::from(Span::styled(
+        status_line_text(app, width),
+        Style::default().fg(Color::DarkGray),
+    )))
+}
+
+fn status_line_text(app: &App, width: usize) -> String {
+    fit_text_to_width(
+        &format!("model: {}  workspace: {}", app.cfg.model, pretty_cwd()),
+        width,
+    )
+}
+
+fn fit_text_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        let ch_width = char_width(ch);
+        if ch_width == 0 {
+            continue;
+        }
+        if used + ch_width > width {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out
 }
 
 fn pretty_cwd() -> String {
@@ -224,25 +559,8 @@ fn pretty_cwd() -> String {
     cwd
 }
 
-/// "{user_name}\n<wrapped text>\n" formatted for tests and legacy callers.
-#[cfg(test)]
-pub fn user_message_lines(user_name: &str, text: &str, width: usize) -> Vec<Line<'static>> {
-    let mut out = vec![Line::from(Span::styled(
-        user_name.to_string(),
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    ))];
-    for v in wrap_text_block(text, width) {
-        out.push(Line::raw(v));
-    }
-    out.push(Line::raw(""));
-    out
-}
-
-/// Paint a `Vec<Line>` into a buffer without emitting printable spaces for
-/// wide-character continuation cells.
-#[cfg(test)]
+/// Paint a `Vec<Line>` into an inline history buffer without emitting printable
+/// spaces for wide-character continuation cells.
 pub fn paint_lines(buf: &mut Buffer, lines: Vec<Line<'static>>) {
     let area = buf.area;
     for (row, line) in lines.iter().enumerate() {
@@ -260,7 +578,6 @@ fn char_width(ch: char) -> usize {
     }
 }
 
-#[cfg(test)]
 fn paint_line(buf: &mut Buffer, mut x: u16, y: u16, line: &Line<'_>) {
     let right = buf.area.right();
     for span in line {
@@ -335,7 +652,51 @@ fn pop_last_char_from_line(line: &mut String, line_width: &mut usize) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AltScreenMode, Persona, ResolvedConfig, TuiConfig};
+    use crate::provider::Provider;
     use ratatui::layout::Rect;
+
+    fn test_app() -> App {
+        App::new(
+            ResolvedConfig {
+                provider: Provider::DeepSeek,
+                base_url: "https://example.test/v1".into(),
+                api_key: "test-key".into(),
+                model: "deepseek-v4-flash".into(),
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+                stop: Vec::new(),
+                persona: Persona {
+                    user_name: "Rose".into(),
+                    assistant_name: "Aili".into(),
+                    description: String::new(),
+                },
+                tui: TuiConfig {
+                    alternate_screen: AltScreenMode::Never,
+                },
+            },
+            reqwest::Client::new(),
+        )
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn assert_lines_fit(lines: &[Line<'_>], width: usize) {
+        assert!(
+            lines.iter().all(|line| line_width(line) <= width),
+            "line wider than {width}: {:?}",
+            lines
+                .iter()
+                .map(|line| line_width(line))
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn wraps_cjk_without_inserting_spaces() {
@@ -354,6 +715,76 @@ mod tests {
     fn user_header_uses_configured_name() {
         let lines = user_message_lines("Rose", "hi", 80);
         assert_eq!(lines[0].spans[0].content.as_ref(), "Rose");
+    }
+
+    #[test]
+    fn welcome_card_has_border() {
+        let lines = with_border(vec![Line::raw("Aili")]);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "╭──────╮");
+        assert_eq!(lines[2].spans[0].content.as_ref(), "╰──────╯");
+    }
+
+    #[test]
+    fn welcome_lines_fit_terminal_width() {
+        let app = test_app();
+        for width in [8, 20, 40, 80] {
+            let lines = welcome_page_lines(&app, width);
+            assert_lines_fit(&lines, width);
+        }
+    }
+
+    #[test]
+    fn welcome_logo_is_left_of_text_when_wide() {
+        let app = test_app();
+        let lines = welcome_page_lines(&app, 80);
+        let logo_row = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains("U^ｪ^U"))
+            .expect("logo row");
+        let logo_idx = logo_row.find("U^ｪ^U").unwrap();
+        let text_idx = logo_row.find("Welcome back, Rose!").unwrap();
+        assert!(logo_idx <= 4);
+        assert!(logo_idx < text_idx);
+    }
+
+    #[test]
+    fn status_line_shows_model_and_workspace() {
+        let app = test_app();
+        let status = status_line_text(&app, 120);
+        assert!(status.contains("model: deepseek-v4-flash"));
+        assert!(status.contains("workspace:"));
+    }
+
+    #[test]
+    fn status_line_truncates_to_width() {
+        let app = test_app();
+        let status = status_line_text(&app, 12);
+        assert!(UnicodeWidthStr::width(status.as_str()) <= 12);
+    }
+
+    #[test]
+    fn with_border_wraps_combined_text_and_logo_block() {
+        // Simulate the post-merge content: a few "text" lines + same-row logo spans.
+        let mut combined: Vec<Line<'static>> = Vec::new();
+        for _ in 0..6 {
+            combined.push(Line::from(vec![
+                Span::raw("hello world         "),
+                Span::raw("   "),
+                Span::raw("▀▀▄▀█▀▄▀"),
+            ]));
+        }
+        let bordered = with_border(combined);
+        assert!(bordered[0].spans[0].content.starts_with("╭"));
+        assert!(
+            bordered[bordered.len() - 1].spans[0]
+                .content
+                .starts_with("╰")
+        );
+        for line in &bordered[1..bordered.len() - 1] {
+            assert_eq!(line.spans[0].content.as_ref(), "│ ");
+            assert_eq!(line.spans.last().unwrap().content.as_ref(), " │");
+        }
     }
 
     #[test]

@@ -108,7 +108,7 @@ pub struct StreamDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Persona;
+    use crate::config::{Persona, TuiConfig};
     use crate::provider::Provider;
 
     fn cfg() -> ResolvedConfig {
@@ -122,6 +122,7 @@ mod tests {
             max_tokens: Some(128),
             stop: vec![],
             persona: Persona::default(),
+            tui: TuiConfig::default(),
         }
     }
 
