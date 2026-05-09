@@ -1,5 +1,3 @@
-mod anthropic;
-mod gemini;
 mod openai_compat;
 
 use anyhow::Result;
@@ -8,7 +6,6 @@ use tokio::sync::mpsc;
 
 use crate::chat::Message;
 use crate::config::ResolvedConfig;
-use crate::provider::Protocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamOutcome {
@@ -21,10 +18,11 @@ pub enum StreamOutcome {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Token(String),
+    /// Usage info from the final stream chunk (total tokens used).
+    Usage { total_tokens: usize },
 }
 
-/// Dispatch a streaming chat request to the right protocol adapter. Tokens
-/// arrive through `tx`; cancellation is signalled by `cancel` resolving.
+/// Dispatch a streaming chat request to DeepSeek's OpenAI-compatible API.
 pub async fn run_stream(
     client: &reqwest::Client,
     cfg: &ResolvedConfig,
@@ -32,28 +30,5 @@ pub async fn run_stream(
     tx: mpsc::Sender<StreamEvent>,
     cancel: impl Future<Output = ()>,
 ) -> Result<StreamOutcome> {
-    match cfg.provider.protocol() {
-        Protocol::OpenAICompat => openai_compat::run(client, cfg, messages, tx, cancel).await,
-        Protocol::Anthropic => anthropic::run(client, cfg, messages, tx, cancel).await,
-        Protocol::Gemini => gemini::run(client, cfg, messages, tx, cancel).await,
-    }
-}
-
-/// For local providers, do a cheap GET /models to surface "server is down"
-/// before we dive into a streaming POST. Skipped for remote providers.
-pub async fn probe_local(client: &reqwest::Client, cfg: &ResolvedConfig) -> Result<()> {
-    if !cfg.provider.is_local() {
-        return Ok(());
-    }
-    let url = format!("{}/models", cfg.base_url);
-    match client.get(&url).bearer_auth(&cfg.api_key).send().await {
-        Ok(_) => Ok(()),
-        Err(e) => anyhow::bail!(
-            "could not reach {} ({}): {}\nhint: {}",
-            cfg.base_url,
-            cfg.provider.as_str(),
-            e,
-            cfg.provider.unreachable_hint()
-        ),
-    }
+    openai_compat::run(client, cfg, messages, tx, cancel).await
 }

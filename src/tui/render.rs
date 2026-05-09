@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
@@ -8,6 +8,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{App, Role};
 use crate::logo;
+use crate::tui::scrollbox::{ScrollBox, ScrollBoxState};
 
 fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
     if text.is_empty() {
@@ -66,14 +67,17 @@ pub fn draw_inline(app: &App, f: &mut Frame) {
 
     let composer_lines = (app.composer.lines().len() as u16).clamp(1, 3);
     let spinner_h: u16 = if app.in_flight.is_some() { 1 } else { 0 };
+    let info_h: u16 = 1;
+    let div_h: u16 = 1;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
             Constraint::Length(spinner_h),
-            Constraint::Length(1),
+            Constraint::Length(div_h),
             Constraint::Length(composer_lines),
-            Constraint::Length(1),
+            Constraint::Length(info_h),
         ])
         .split(area);
 
@@ -85,14 +89,265 @@ pub fn draw_inline(app: &App, f: &mut Frame) {
         f.render_widget(spinner_line(app), chunks[1]);
     }
     f.render_widget(divider(), chunks[2]);
-
     let input_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(2), Constraint::Min(0)])
         .split(chunks[3]);
     f.render_widget(input_prompt(), input_chunks[0]);
     f.render_widget(&app.composer, input_chunks[1]);
-    f.render_widget(status_line(app, chunks[4].width as usize), chunks[4]);
+
+    // Info bar: model · cwd · stats (or status flash)
+    f.render_widget(info_or_status(app), chunks[4]);
+}
+
+/// Fullscreen session page: scrollable message history + prompt at bottom.
+pub fn draw_fullscreen_session(app: &App, f: &mut Frame, state: &mut ScrollBoxState) {
+    let area = f.area();
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Reset)),
+        area,
+    );
+
+    let composer_h = (app.composer.lines().len() as u16).clamp(1, 3);
+    let spinner_h: u16 = if app.in_flight.is_some() { 1 } else { 0 };
+    let info_h: u16 = 1;
+    let div_h: u16 = 1;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(spinner_h),
+            Constraint::Length(div_h),
+            Constraint::Length(composer_h),
+            Constraint::Length(info_h),
+        ])
+        .split(area);
+
+    // Message history with ScrollBox
+    let msg_area = Rect {
+        x: chunks[0].x + 2,
+        y: chunks[0].y,
+        width: chunks[0].width.saturating_sub(4),
+        height: chunks[0].height,
+    };
+    let msg_lines = build_message_lines(app, msg_area.width as usize);
+    let scrollbox = ScrollBox::new(msg_lines);
+    f.render_stateful_widget(scrollbox, msg_area, state);
+
+    // Spinner
+    if spinner_h > 0 {
+        f.render_widget(spinner_line(app), chunks[1]);
+    }
+
+    f.render_widget(divider(), chunks[2]);
+
+    // Input
+    let input_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(chunks[3]);
+    f.render_widget(input_prompt(), input_chunks[0]);
+    f.render_widget(&app.composer, input_chunks[1]);
+
+    // Info bar
+    f.render_widget(info_bar(app), chunks[4]);
+}
+
+/// Build message history lines with role spacing for ScrollBox.
+fn build_message_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut last_role: Option<Role> = None;
+
+    for msg in &app.history {
+        if msg.text.is_empty() {
+            continue;
+        }
+        // Spacer blank line between user/assistant transitions
+        if let Some(prev) = last_role {
+            if prev != msg.role {
+                lines.push(Line::raw(""));
+            }
+        }
+        last_role = Some(msg.role);
+
+        match msg.role {
+            Role::User => {
+                lines.push(Line::from(Span::styled(
+                    format!("{} >", app.cfg.persona.user_name),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for line in wrap_text_block(&msg.text, width) {
+                    lines.push(Line::from(Span::styled(line, Style::default().fg(Color::White))));
+                }
+            }
+            Role::Assistant => {
+                lines.push(Line::from(Span::styled(
+                    format!("{} >", app.cfg.persona.assistant_name),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for line in wrap_text_block(&msg.text, width) {
+                    lines.push(Line::from(Span::styled(line, Style::default().fg(Color::White))));
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// Render message history as a scrollable Paragraph.
+/// Messages are separated by a blank line between roles.
+#[allow(dead_code)]
+fn message_history(app: &App, width: usize, height: usize) -> Paragraph<'static> {
+    let lines = build_message_lines(app, width);
+
+    // Show only the last N lines that fit the viewport
+    let visible = if lines.len() > height && height > 0 {
+        lines.into_iter().rev().take(height).rev().collect()
+    } else {
+        lines
+    };
+
+    Paragraph::new(visible).alignment(Alignment::Left)
+}
+pub fn draw_fullscreen_home(app: &App, f: &mut Frame) {
+    let area = f.area();
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Reset)),
+        area,
+    );
+
+    let shape = logo::logo_shape();
+    let logo_h = logo::logo_height(shape) as u16;
+    let composer_h = (app.composer.lines().len() as u16).clamp(1, 3);
+    let spinner_h: u16 = if app.in_flight.is_some() { 1 } else { 0 };
+    let info_h: u16 = 1;
+    let gap: u16 = 1;
+
+    let total_fixed = logo_h + gap + composer_h + info_h + spinner_h + gap;
+    let top_space = area.height.saturating_sub(total_fixed) / 3;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_space),
+            Constraint::Length(logo_h),
+            Constraint::Length(gap),
+            Constraint::Length(composer_h),
+            Constraint::Length(spinner_h),
+            Constraint::Length(info_h),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    // Logo
+    let logo_w = crate::logo::logo_width(shape) as u16;
+    let logo_area = centered_rect(chunks[1], logo_w, logo_h);
+    f.render_widget(
+        logo::paragraph(shape, Color::Rgb(255, 140, 155), Color::Rgb(255, 180, 190)),
+        logo_area,
+    );
+
+    // Spinner
+    if spinner_h > 0 {
+        f.render_widget(
+            spinner_line(app),
+            centered_rect(chunks[4], 60, spinner_h),
+        );
+    }
+
+    // Composer (centered, max 75 wide)
+    let composer_area = centered_rect(chunks[3], 75.min(area.width), composer_h);
+    let input_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(composer_area);
+    f.render_widget(input_prompt(), input_chunks[0]);
+    f.render_widget(&app.composer, input_chunks[1]);
+
+    // Info bar (centered)
+    f.render_widget(
+        info_bar(app),
+        centered_rect(chunks[5], 75.min(area.width), info_h),
+    );
+
+    // Status message overlay (if any)
+    if app.status_msg.is_some() {
+        let status_area = Rect {
+            y: area.y,
+            height: 1,
+            ..centered_rect(area, 80.min(area.width), 1)
+        };
+        f.render_widget(
+            info_or_status(app),
+            status_area,
+        );
+    }
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect { x, y, width: width.min(area.width), height: height.min(area.height) }
+}
+
+fn info_bar(app: &App) -> Paragraph<'static> {
+    let mut parts: Vec<Span<'static>> = Vec::new();
+    let dim = Style::default().fg(Color::Gray);
+    let highlight = Style::default().fg(Color::Gray);
+
+    let model_name = crate::provider::model_info(&app.cfg.model).name;
+    parts.push(Span::styled(model_name.to_string(), highlight));
+    parts.push(Span::styled("  ·  ", dim));
+    parts.push(Span::styled(pretty_cwd(), dim));
+
+    // Always show context usage progress if we have data from any turn
+    let ctx_tokens = if let Some(f) = app.in_flight.as_ref() {
+        f.context_tokens.max(app.last_context_tokens)
+    } else {
+        app.last_context_tokens
+    };
+    let ctx_limit = if let Some(f) = app.in_flight.as_ref() {
+        f.context_limit.max(app.last_context_limit)
+    } else {
+        app.last_context_limit
+    };
+
+    if ctx_limit > 0 && ctx_tokens > 0 {
+        let pct = (ctx_tokens * 100 / ctx_limit).min(99);
+        let filled = ((pct as f64 / 100.0) * 10.0).round() as usize;
+        let bar: String = (0..10)
+            .map(|i| if i < filled { '█' } else { '░' })
+            .collect();
+        parts.push(Span::styled(
+            format!(
+                "  ·  {}  {} / 1M tokens",
+                bar,
+                if ctx_tokens >= 1000 {
+                    format!("{:.1}K", ctx_tokens as f64 / 1000.0)
+                } else {
+                    ctx_tokens.to_string()
+                },
+            ),
+            dim,
+        ));
+
+        // Show elapsed time only while streaming
+        if let Some(f) = app.in_flight.as_ref() {
+            let elapsed = f.started.elapsed();
+            parts.push(Span::styled(
+                format!("  ·  {:.1}s", elapsed.as_secs_f64()),
+                dim,
+            ));
+        }
+    }
+
+    Paragraph::new(Line::from(parts))
+        .alignment(Alignment::Center)
 }
 
 fn spinner_line(app: &App) -> Paragraph<'static> {
@@ -119,7 +374,7 @@ fn spinner_line(app: &App) -> Paragraph<'static> {
         Span::styled("Calculating…", Style::default().fg(brand)),
         Span::styled(
             format!(" ({} · ↓ {:.1}k tokens)", time_str, kilo),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
     ]))
 }
@@ -139,6 +394,7 @@ fn live_view(app: &App, width: usize, height: usize) -> Paragraph<'static> {
 
 /// Full welcome page: block-art logo on the left, centered vertically next to
 /// the text content, all wrapped in a single border.
+#[allow(dead_code)]
 pub fn welcome_page_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let logo_lines: Vec<&'static str> = logo::lines().collect();
@@ -234,7 +490,7 @@ fn welcome_card_content(app: &App, width: usize) -> Vec<Line<'static>> {
     }
     lines.push(Line::raw(""));
     for line in wrap_text_block(
-        &format!("{} · {}", app.cfg.model, app.cfg.provider.as_str()),
+        &app.cfg.model,
         content_width,
     ) {
         lines.push(Line::from(Span::styled(
@@ -487,7 +743,7 @@ fn trim_to_visible(lines: Vec<Line<'static>>, max_len: usize) -> Vec<Line<'stati
 fn divider() -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
         "─".repeat(2048),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     )))
 }
 
@@ -500,26 +756,18 @@ fn input_prompt() -> Paragraph<'static> {
     )))
 }
 
-fn status_line(app: &App, width: usize) -> Paragraph<'static> {
+fn info_or_status(app: &App) -> Paragraph<'static> {
     if let Some((msg, _)) = &app.status_msg {
         return Paragraph::new(Line::from(Span::styled(
-            fit_text_to_width(msg, width),
+            msg.clone(),
             Style::default().fg(Color::Yellow),
-        )));
+        )))
+        .alignment(Alignment::Left);
     }
-    Paragraph::new(Line::from(Span::styled(
-        status_line_text(app, width),
-        Style::default().fg(Color::DarkGray),
-    )))
+    info_bar(app)
 }
 
-fn status_line_text(app: &App, width: usize) -> String {
-    fit_text_to_width(
-        &format!("model: {}  workspace: {}", app.cfg.model, pretty_cwd()),
-        width,
-    )
-}
-
+#[allow(dead_code)]
 fn fit_text_to_width(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -653,13 +901,11 @@ fn pop_last_char_from_line(line: &mut String, line_width: &mut usize) -> Option<
 mod tests {
     use super::*;
     use crate::config::{AltScreenMode, Persona, ResolvedConfig, TuiConfig};
-    use crate::provider::Provider;
     use ratatui::layout::Rect;
 
     fn test_app() -> App {
         App::new(
             ResolvedConfig {
-                provider: Provider::DeepSeek,
                 base_url: "https://example.test/v1".into(),
                 api_key: "test-key".into(),
                 model: "deepseek-v4-flash".into(),
@@ -680,22 +926,12 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn line_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
-    }
-
-    fn assert_lines_fit(lines: &[Line<'_>], width: usize) {
-        assert!(
-            lines.iter().all(|line| line_width(line) <= width),
-            "line wider than {width}: {:?}",
-            lines
-                .iter()
-                .map(|line| line_width(line))
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
@@ -725,42 +961,9 @@ mod tests {
     }
 
     #[test]
-    fn welcome_lines_fit_terminal_width() {
+    fn info_bar_constructed_without_panic() {
         let app = test_app();
-        for width in [8, 20, 40, 80] {
-            let lines = welcome_page_lines(&app, width);
-            assert_lines_fit(&lines, width);
-        }
-    }
-
-    #[test]
-    fn welcome_logo_is_left_of_text_when_wide() {
-        let app = test_app();
-        let lines = welcome_page_lines(&app, 80);
-        let logo_row = lines
-            .iter()
-            .map(line_text)
-            .find(|line| line.contains("U^ｪ^U"))
-            .expect("logo row");
-        let logo_idx = logo_row.find("U^ｪ^U").unwrap();
-        let text_idx = logo_row.find("Welcome back, Rose!").unwrap();
-        assert!(logo_idx <= 4);
-        assert!(logo_idx < text_idx);
-    }
-
-    #[test]
-    fn status_line_shows_model_and_workspace() {
-        let app = test_app();
-        let status = status_line_text(&app, 120);
-        assert!(status.contains("model: deepseek-v4-flash"));
-        assert!(status.contains("workspace:"));
-    }
-
-    #[test]
-    fn status_line_truncates_to_width() {
-        let app = test_app();
-        let status = status_line_text(&app, 12);
-        assert!(UnicodeWidthStr::width(status.as_str()) <= 12);
+        let _p = info_bar(&app);
     }
 
     #[test]

@@ -2,156 +2,88 @@ use anyhow::{Context, Result, bail};
 use std::io::{self, BufRead, Write};
 
 use crate::config;
-use crate::provider::Provider;
+use crate::provider::{self, DeepSeekModel, V4_FLASH, V4_PRO};
 
 const HEADER: &str = "\n\
 Welcome to Aili. Let's get you set up. (Ctrl-C anytime to abort)\n";
 
-/// Run the first-run interactive wizard. Writes config + secrets to disk on
-/// success.
 pub fn run() -> Result<()> {
     println!("{HEADER}");
 
-    let provider = ask_provider()?;
-    let api_key = if provider.requires_api_key() {
-        Some(ask_api_key(provider)?)
-    } else {
-        None
-    };
-    let model = ask_model(provider)?;
+    let api_key = ask_api_key()?;
+    let model = ask_model()?;
     let user_name = ask_user_name()?;
 
-    config::write_wizard_result(provider, &model, &user_name, api_key.as_deref())?;
+    config::write_wizard_result(&model.id, &user_name, Some(&api_key))?;
 
     println!();
     println!("✓ wrote {}", config::config_path()?.display());
-    if let Some(k) = api_key.as_deref() {
-        let secrets = config::secrets_path()?;
-        if !secrets.exists() {
-            bail!(
-                "expected to have written {}, but it doesn't exist",
-                secrets.display()
-            );
-        }
-        println!("✓ wrote {} (chmod 600)", secrets.display());
-        println!(
-            "  key fingerprint: {}…{}  (length {})",
-            &k.chars().take(4).collect::<String>(),
-            &k.chars()
-                .rev()
-                .take(4)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>(),
-            k.chars().count()
-        );
-    }
+    let secrets = config::secrets_path()?;
+    println!("✓ wrote {} (chmod 600)", secrets.display());
+    println!(
+        "  key fingerprint: {}…{}  (length {})",
+        &api_key.chars().take(4).collect::<String>(),
+        &api_key
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>(),
+        api_key.chars().count()
+    );
     println!();
     println!("Starting Aili...");
     println!();
     Ok(())
 }
 
-fn ask_provider() -> Result<Provider> {
-    println!("[1/4] Which provider?");
-    let providers = Provider::all();
-    for (i, p) in providers.iter().enumerate() {
-        let suffix = if matches!(p, Provider::DeepSeek) {
-            "  (recommended)"
-        } else {
-            ""
-        };
-        println!("  {}) {}{}", i + 1, p.display_label(), suffix);
-    }
-    loop {
-        let raw = prompt("> ")?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            // Default to first option (DeepSeek).
-            return Ok(providers[0]);
-        }
-        if let Ok(n) = trimmed.parse::<usize>() {
-            if n >= 1 && n <= providers.len() {
-                return Ok(providers[n - 1]);
-            }
-        }
-        if let Ok(p) = Provider::parse(trimmed) {
-            return Ok(p);
-        }
-        println!("  invalid choice; pick a number 1–{}.", providers.len());
-    }
-}
-
-fn ask_api_key(provider: Provider) -> Result<String> {
-    let env_name = provider.default_api_key_env().unwrap_or("PROVIDER_API_KEY");
+fn ask_api_key() -> Result<String> {
     println!();
-    println!("[2/4] Paste your {} API key.", provider.display_label());
+    println!("[1/3] Paste your DeepSeek API key.");
     println!(
         "      Stored in {} (chmod 600).",
         config::secrets_path()?.display()
     );
-    println!("      Or press Enter to skip and set the {env_name} env var manually later.");
+    println!("      Or press Enter to skip and set the DEEPSEEK_API_KEY env var manually later.");
     let key = rpassword::prompt_password("> ").context("failed to read API key from stdin")?;
     let key = key.trim().to_string();
     if key.is_empty() {
         bail!(
             "no API key provided; rerun the wizard or set {} manually",
-            env_name
+            provider::API_KEY_ENV
         );
     }
     Ok(key)
 }
 
-fn ask_model(provider: Provider) -> Result<String> {
+fn ask_model() -> Result<&'static DeepSeekModel> {
     println!();
-    println!("[3/4] Default model:");
-    let presets = provider.model_presets();
-    if presets.is_empty() {
-        println!(
-            "  no presets for {}. Type the model id you want as default.",
-            provider.display_label()
-        );
-        loop {
-            let raw = prompt("> ")?;
-            let t = raw.trim().to_string();
-            if !t.is_empty() {
-                return Ok(t);
-            }
-            println!("  please enter a non-empty model id.");
-        }
-    }
-    for (i, m) in presets.iter().enumerate() {
-        let suffix = if i == 0 { "  (recommended)" } else { "" };
-        println!("  {}) {}{}", i + 1, m, suffix);
-    }
-    println!("  (or type a custom model id)");
+    println!("[2/3] Choose default model:");
+    println!("  1) {}  V4 Flash  (recommended)", V4_FLASH.id);
+    println!("  2) {}  V4 Pro", V4_PRO.id);
     loop {
         let raw = prompt("> ")?;
         let t = raw.trim();
         if t.is_empty() {
-            return Ok(presets[0].to_string());
+            return Ok(&V4_FLASH);
         }
-        if let Ok(n) = t.parse::<usize>() {
-            if n >= 1 && n <= presets.len() {
-                return Ok(presets[n - 1].to_string());
-            }
-        }
-        // Treat anything else as a custom model id.
-        if !t.is_empty() {
-            return Ok(t.to_string());
+        match t {
+            "1" => return Ok(&V4_FLASH),
+            "2" => return Ok(&V4_PRO),
+            _ => println!("  enter 1 or 2"),
         }
     }
 }
 
 fn ask_user_name() -> Result<String> {
     println!();
-    println!("[4/4] What should Aili call you?");
+    println!("[3/3] What should Aili call you?");
     loop {
         let raw = prompt("> ")?;
         let t = raw.trim().to_string();
         if t.is_empty() {
-            // Empty -> "you" placeholder.
             return Ok("you".to_string());
         }
         if t.len() > 64 {
@@ -171,7 +103,6 @@ fn prompt(label: &str) -> Result<String> {
         .read_line(&mut buf)
         .context("failed to read from stdin")?;
     if buf.is_empty() {
-        // EOF reached.
         bail!("aborted (eof)");
     }
     Ok(buf)

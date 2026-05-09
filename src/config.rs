@@ -4,13 +4,10 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::provider::Provider;
-
 // ───────────────────────────── on-disk schema ─────────────────────────────
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RawConfig {
-    /// New-style nested layout (v0.3+).
     #[serde(default)]
     pub core: Option<CoreSection>,
     #[serde(default)]
@@ -20,7 +17,7 @@ pub struct RawConfig {
     #[serde(default)]
     pub tui: Option<TuiSection>,
 
-    // Legacy flat fields (v0.1 / v0.2). Loader migrates these into Core.
+    // Legacy flat fields (v0.1 / v0.2). Ignored if core section present.
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
@@ -41,9 +38,11 @@ pub struct RawConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CoreSection {
-    pub provider: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>, // ignored; always DeepSeek
     pub model: Option<String>,
-    pub base_url: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>, // ignored; hardcoded deepseek url
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub initialized: bool,
@@ -90,7 +89,6 @@ struct SecretsFile {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
-    pub provider: Provider,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -167,8 +165,6 @@ pub enum LoadResult {
     NeedsInit,
 }
 
-/// Load and resolve config. Returns `NeedsInit` if no config exists or it has
-/// not been marked initialized — caller should run the wizard.
 pub fn load() -> Result<LoadResult> {
     let path = config_path()?;
     if !path.exists() {
@@ -187,34 +183,15 @@ pub fn load() -> Result<LoadResult> {
     Ok(LoadResult::Loaded(resolve(cfg)?))
 }
 
-pub fn resolve(raw: RawConfig) -> Result<ResolvedConfig> {
-    // Pull provider from new core section if present, else legacy flat field.
-    let provider_str = raw
-        .core
-        .as_ref()
-        .and_then(|c| c.provider.clone())
-        .or_else(|| raw.provider.clone())
-        .context("config missing `[core].provider` or top-level `provider`")?;
-    let provider = Provider::parse(&provider_str)?;
-
-    let base_url = raw
-        .core
-        .as_ref()
-        .and_then(|c| c.base_url.clone())
-        .or_else(|| raw.base_url.clone())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| provider.default_base_url().to_string())
-        .trim_end_matches('/')
-        .to_string();
-
+fn resolve(raw: RawConfig) -> Result<ResolvedConfig> {
     let env_name = raw
         .core
         .as_ref()
         .and_then(|c| c.api_key_env.clone())
         .or_else(|| raw.api_key_env.clone())
-        .or_else(|| provider.default_api_key_env().map(|s| s.to_string()));
+        .filter(|s| !s.is_empty());
 
-    let api_key = resolve_api_key(provider, env_name.as_deref())?;
+    let api_key = resolve_api_key(env_name.as_deref())?;
 
     let model = raw
         .core
@@ -222,7 +199,7 @@ pub fn resolve(raw: RawConfig) -> Result<ResolvedConfig> {
         .and_then(|c| c.model.clone())
         .or_else(|| raw.model.clone())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| provider.default_model().to_string());
+        .unwrap_or_else(|| crate::provider::DEFAULT_MODEL.id.to_string());
 
     let sampling = raw.sampling.unwrap_or_default();
     let temperature = sampling.temperature.or(raw.temperature);
@@ -248,8 +225,7 @@ pub fn resolve(raw: RawConfig) -> Result<ResolvedConfig> {
     };
 
     Ok(ResolvedConfig {
-        provider,
-        base_url,
+        base_url: crate::provider::BASE_URL.to_string(),
         api_key,
         model,
         temperature,
@@ -261,43 +237,21 @@ pub fn resolve(raw: RawConfig) -> Result<ResolvedConfig> {
     })
 }
 
-fn resolve_api_key(provider: Provider, env_name: Option<&str>) -> Result<String> {
-    if let Some(name) = env_name.filter(|s| !s.is_empty()) {
-        if let Ok(v) = std::env::var(name) {
-            if !v.is_empty() {
-                return Ok(v);
-            }
-        }
-        // Fall through to secrets.toml lookup using the same name.
-        if let Some(v) = read_secret(name)? {
+fn resolve_api_key(env_name: Option<&str>) -> Result<String> {
+    let name = env_name.unwrap_or(crate::provider::API_KEY_ENV);
+    if let Ok(v) = std::env::var(name) {
+        if !v.is_empty() {
             return Ok(v);
         }
-        if !provider.requires_api_key() {
-            return Ok(local_placeholder(provider));
-        }
-        bail!(
-            "no API key found for {}. set env `{}` or add it to {}",
-            provider.as_str(),
-            name,
-            secrets_path()?.display()
-        );
     }
-    // No env name configured.
-    if !provider.requires_api_key() {
-        return Ok(local_placeholder(provider));
+    if let Some(v) = read_secret(name)? {
+        return Ok(v);
     }
     bail!(
-        "{} requires an api_key_env. default would be `{}`",
-        provider.as_str(),
-        provider.default_api_key_env().unwrap_or("PROVIDER_API_KEY")
+        "no DeepSeek API key found. set env `{}` or add it to {}",
+        name,
+        secrets_path()?.display()
     );
-}
-
-fn local_placeholder(provider: Provider) -> String {
-    match provider {
-        Provider::Ollama => "ollama".into(),
-        _ => "local".into(),
-    }
 }
 
 fn read_secret(name: &str) -> Result<Option<String>> {
@@ -318,7 +272,6 @@ const TEMPLATE: &str = r#"# Aili config
 # Edit by hand or rerun the wizard with `aili init`.
 
 [core]
-provider     = "deepseek"
 model        = "deepseek-v4-flash"
 api_key_env  = "DEEPSEEK_API_KEY"
 initialized  = false              # wizard sets this to true
@@ -335,7 +288,6 @@ description    = ""
 
 [tui]
 # Aili's main chat uses inline terminal scrollback by default.
-# `always` is reserved for future fullscreen overlays.
 alternate_screen = "auto"
 "#;
 
@@ -354,28 +306,15 @@ pub fn write_template(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Atomically write the wizard's resolved choices to disk.
-pub fn write_wizard_result(
-    provider: Provider,
-    model: &str,
-    user_name: &str,
-    api_key: Option<&str>,
-) -> Result<()> {
+pub fn write_wizard_result(model: &str, user_name: &str, api_key: Option<&str>) -> Result<()> {
     let dir = config_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
 
-    let mut toml_str = format!(
+    let toml_str = format!(
         "[core]\n\
-         provider     = \"{provider}\"\n\
-         model        = \"{model}\"\n",
-        provider = provider.as_str(),
-        model = escape_toml_string(model),
-    );
-    if let Some(env_name) = provider.default_api_key_env() {
-        toml_str.push_str(&format!("api_key_env  = \"{env_name}\"\n"));
-    }
-    toml_str.push_str(&format!(
-        "initialized  = true\n\
+         model        = \"{model}\"\n\
+         api_key_env  = \"DEEPSEEK_API_KEY\"\n\
+         initialized  = true\n\
          \n\
          [persona]\n\
          user_name      = \"{user}\"\n\
@@ -389,18 +328,19 @@ pub fn write_wizard_result(
          \n\
          [tui]\n\
          alternate_screen = \"auto\"\n",
+        model = escape_toml_string(model),
         user = escape_toml_string(user_name),
-    ));
+    );
     let cfg_path = config_path()?;
     write_atomic(&cfg_path, &toml_str, None)?;
 
-    if let (Some(env_name), Some(key)) = (provider.default_api_key_env(), api_key) {
-        merge_secret(env_name, key)?;
+    if let Some(key) = api_key {
+        merge_secret(key)?;
     }
     Ok(())
 }
 
-fn merge_secret(env_name: &str, key: &str) -> Result<()> {
+fn merge_secret(key: &str) -> Result<()> {
     let path = secrets_path()?;
     let mut current: SecretsFile = if path.exists() {
         let raw = std::fs::read_to_string(&path)
@@ -409,7 +349,9 @@ fn merge_secret(env_name: &str, key: &str) -> Result<()> {
     } else {
         SecretsFile::default()
     };
-    current.keys.insert(env_name.to_string(), key.to_string());
+    current
+        .keys
+        .insert(crate::provider::API_KEY_ENV.to_string(), key.to_string());
 
     let mut body = String::from("# Aili secrets — chmod 600. Do not commit.\n[keys]\n");
     let mut entries: Vec<(&String, &String)> = current.keys.iter().collect();
@@ -418,7 +360,6 @@ fn merge_secret(env_name: &str, key: &str) -> Result<()> {
         body.push_str(&format!("{} = \"{}\"\n", k, escape_toml_string(v)));
     }
     write_atomic(&path, &body, Some(0o600))?;
-
     Ok(())
 }
 
@@ -517,12 +458,10 @@ mod tests {
     fn legacy_schema_resolves() {
         unsafe { std::env::set_var("AILI_TEST_LEGACY_KEY", "sk-test-legacy") };
         let raw = RawConfig {
-            provider: Some("deepseek".into()),
             api_key_env: Some("AILI_TEST_LEGACY_KEY".into()),
             ..Default::default()
         };
         let r = resolve(raw).unwrap();
-        assert_eq!(r.provider, Provider::DeepSeek);
         assert_eq!(r.model, "deepseek-v4-flash");
         assert_eq!(r.api_key, "sk-test-legacy");
         assert_eq!(r.persona.user_name, "you");
@@ -535,7 +474,6 @@ mod tests {
         unsafe { std::env::set_var("AILI_TEST_NEW_KEY", "sk-test-new") };
         let raw = RawConfig {
             core: Some(CoreSection {
-                provider: Some("deepseek".into()),
                 model: Some("deepseek-v4-pro".into()),
                 api_key_env: Some("AILI_TEST_NEW_KEY".into()),
                 initialized: true,
@@ -561,7 +499,6 @@ mod tests {
         unsafe { std::env::set_var("AILI_TEST_TUI_KEY", "sk-test-tui") };
         let raw = RawConfig {
             core: Some(CoreSection {
-                provider: Some("deepseek".into()),
                 api_key_env: Some("AILI_TEST_TUI_KEY".into()),
                 initialized: true,
                 ..Default::default()
@@ -576,71 +513,17 @@ mod tests {
     }
 
     #[test]
-    fn ollama_no_key_required() {
-        let raw = RawConfig {
-            core: Some(CoreSection {
-                provider: Some("ollama".into()),
-                model: Some("qwen2.5".into()),
-                initialized: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let r = resolve(raw).unwrap();
-        assert_eq!(r.api_key, "ollama");
-        assert_eq!(r.base_url, "http://localhost:11434/v1");
-    }
-
-    #[test]
-    fn anthropic_default_url_and_env() {
-        unsafe { std::env::set_var("AILI_TEST_ANTHROPIC", "sk-ant-test") };
-        let raw = RawConfig {
-            core: Some(CoreSection {
-                provider: Some("anthropic".into()),
-                api_key_env: Some("AILI_TEST_ANTHROPIC".into()),
-                initialized: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let r = resolve(raw).unwrap();
-        assert_eq!(r.base_url, "https://api.anthropic.com/v1");
-        assert_eq!(r.api_key, "sk-ant-test");
-        assert_eq!(r.model, "claude-opus-4-7");
-    }
-
-    #[test]
-    fn gemini_default() {
-        unsafe { std::env::set_var("AILI_TEST_GEMINI", "AIza-test") };
-        let raw = RawConfig {
-            core: Some(CoreSection {
-                provider: Some("gemini".into()),
-                api_key_env: Some("AILI_TEST_GEMINI".into()),
-                initialized: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let r = resolve(raw).unwrap();
-        assert_eq!(r.api_key, "AIza-test");
-        assert_eq!(r.model, "gemini-2.5-pro");
-    }
-
-    #[test]
     fn missing_env_errors_for_remote() {
         unsafe { std::env::remove_var("AILI_TEST_NO_SUCH_VAR") };
         let raw = RawConfig {
             core: Some(CoreSection {
-                provider: Some("deepseek".into()),
                 api_key_env: Some("AILI_TEST_NO_SUCH_VAR".into()),
                 initialized: true,
                 ..Default::default()
             }),
             ..Default::default()
         };
-        // secrets.toml lookup may or may not find this — we just want a fallback or error.
         let r = resolve(raw);
-        // If no secrets.toml entry exists the call must error.
         if r.is_ok() {
             // skip: a real secrets.toml on this test machine has the var; not our concern.
         }
@@ -650,16 +533,9 @@ mod tests {
     fn wizard_result_writes_config_and_secret_then_loads() {
         let dir = temp_config_dir("wizard");
         with_config_dir(&dir, || {
-            write_wizard_result(
-                Provider::DeepSeek,
-                "deepseek-v4-flash",
-                "Rose",
-                Some("sk-test-wizard"),
-            )
-            .unwrap();
+            write_wizard_result("deepseek-v4-flash", "Rose", Some("sk-test-wizard")).unwrap();
 
             let cfg_raw = std::fs::read_to_string(dir.join("config.toml")).unwrap();
-            assert!(cfg_raw.contains("provider     = \"deepseek\""));
             assert!(cfg_raw.contains("model        = \"deepseek-v4-flash\""));
             assert!(cfg_raw.contains("api_key_env  = \"DEEPSEEK_API_KEY\""));
             assert!(cfg_raw.contains("initialized  = true"));
@@ -681,7 +557,6 @@ mod tests {
 
             match load().unwrap() {
                 LoadResult::Loaded(c) => {
-                    assert_eq!(c.provider, Provider::DeepSeek);
                     assert_eq!(c.model, "deepseek-v4-flash");
                     assert_eq!(c.api_key, "sk-test-wizard");
                     assert_eq!(c.persona.user_name, "Rose");

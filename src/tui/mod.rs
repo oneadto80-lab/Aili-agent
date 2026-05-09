@@ -1,18 +1,25 @@
 mod keymap;
 mod render;
 mod stream_state;
+pub mod scrollbox;
+pub mod dialog;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event as CtEvent, EventStream, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
-use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
+};
+use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::Block;
+use ratatui::text::Line;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::io::{Stdout, stdout};
 use std::time::{Duration, Instant};
@@ -25,9 +32,11 @@ use crate::stream::{StreamEvent, StreamOutcome, run_stream};
 
 use self::keymap::{Action, KeyContext};
 use self::stream_state::StreamState;
+use self::scrollbox::ScrollBoxState;
+use self::dialog::DialogStack;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
-const INLINE_HEIGHT: u16 = 8;
+const INLINE_HEIGHT: u16 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
@@ -51,16 +60,25 @@ pub(crate) struct InFlight {
     cancel_tx: Option<oneshot::Sender<()>>,
     pub started: Instant,
     pub chars: usize,
+    pub context_tokens: usize,
+    pub context_limit: usize,
 }
 
 pub(crate) struct CtrlCArm {
     expires: Instant,
 }
 
-pub async fn run(cfg: ResolvedConfig, client: reqwest::Client) -> Result<()> {
+pub async fn run_split(cfg: ResolvedConfig, client: reqwest::Client) -> Result<()> {
     let mut term = setup_terminal()?;
     let res = App::new(cfg, client).run(&mut term).await;
     restore_terminal(&mut term)?;
+    res
+}
+
+pub async fn run_fullscreen(cfg: ResolvedConfig, client: reqwest::Client) -> Result<()> {
+    let mut term = setup_fullscreen_terminal()?;
+    let res = App::new_fullscreen(cfg, client).run_fullscreen(&mut term).await;
+    restore_fullscreen_terminal(&mut term)?;
     res
 }
 
@@ -96,6 +114,55 @@ fn restore_terminal(term: &mut Term) -> Result<()> {
     Ok(())
 }
 
+fn setup_fullscreen_terminal() -> Result<Term> {
+    enable_raw_mode().context("enable raw mode")?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
+    .context("enter alternate screen")?;
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fullscreen,
+        },
+    )
+    .context("init fullscreen terminal")?;
+    terminal.clear().ok();
+    terminal.hide_cursor().ok();
+    Ok(terminal)
+}
+
+fn restore_fullscreen_terminal(term: &mut Term) -> Result<()> {
+    term.clear().ok();
+    execute!(
+        term.backend_mut(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .ok();
+    term.show_cursor().ok();
+    disable_raw_mode().ok();
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum Phase {
+    Idle,
+    Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Route {
+    Home,
+    Session,
+}
+
 pub(crate) struct App {
     pub cfg: ResolvedConfig,
     pub client: reqwest::Client,
@@ -110,6 +177,12 @@ pub(crate) struct App {
     pub status_msg: Option<(String, Instant)>,
     pub submit_pending: bool,
     welcome_done: bool,
+    pub route: Route,
+    is_fullscreen: bool,
+    pub scroll_state: ScrollBoxState,
+    pub dialog_stack: DialogStack,
+    pub last_context_tokens: usize,
+    pub last_context_limit: usize,
 }
 
 impl App {
@@ -129,7 +202,19 @@ impl App {
             status_msg: None,
             submit_pending: false,
             welcome_done: false,
+            route: Route::Home,
+            is_fullscreen: false,
+            scroll_state: ScrollBoxState::new(),
+            dialog_stack: DialogStack::default(),
+            last_context_tokens: 0,
+            last_context_limit: 0,
         }
+    }
+
+    fn new_fullscreen(cfg: ResolvedConfig, client: reqwest::Client) -> Self {
+        let mut app = Self::new(cfg, client);
+        app.is_fullscreen = true;
+        app
     }
 
     async fn run(mut self, term: &mut Term) -> Result<()> {
@@ -155,11 +240,85 @@ impl App {
                         Err(e) => self.flash(format!("input error: {e}")),
                     }
                 }
-                Some(StreamEvent::Token(t)) = recv_stream(&mut self.in_flight) => {
-                    if let Some(f) = self.in_flight.as_mut() {
-                        f.chars += t.chars().count();
+                Some(stream_ev) = recv_stream(&mut self.in_flight) => {
+                    match stream_ev {
+                        StreamEvent::Token(t) => {
+                            if let Some(f) = self.in_flight.as_mut() {
+                                f.chars += t.chars().count();
+                            }
+                            self.stream.enqueue(t);
+                        }
+                        StreamEvent::Usage { total_tokens } => {
+                            if let Some(f) = self.in_flight.as_mut() {
+                                f.context_tokens = total_tokens;
+                            }
+                            self.last_context_tokens = total_tokens;
+                            self.last_context_limit = crate::provider::CONTEXT_WINDOW;
+                        }
                     }
-                    self.stream.enqueue(t);
+                }
+                _ = tick.tick() => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_fullscreen(mut self, term: &mut Term) -> Result<()> {
+        let mut events = EventStream::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+
+        loop {
+            self.flush_stream(term)?;
+            self.expire_timed();
+            let route = self.route;
+            let mut render_scroll = self.scroll_state.clone();
+            let mut dialog = self.dialog_stack.take();
+            term.draw(|f| match route {
+                Route::Home => {
+                    render::draw_fullscreen_home(&self, f);
+                    if dialog.is_open() {
+                        dialog.render(f.area(), f.buffer_mut());
+                    }
+                }
+                Route::Session => {
+                    render::draw_fullscreen_session(&self, f, &mut render_scroll);
+                    if dialog.is_open() {
+                        dialog.render(f.area(), f.buffer_mut());
+                    }
+                }
+            })?;
+            self.dialog_stack = dialog;
+            self.scroll_state = render_scroll;
+            if self.quit {
+                break;
+            }
+            tokio::select! {
+                biased;
+                Some(app_ev) = self.app_rx.recv() => {
+                    self.on_app_event(app_ev, term)?;
+                }
+                Some(ev) = events.next() => {
+                    match ev {
+                        Ok(ev) => self.on_terminal_event(ev, term)?,
+                        Err(e) => self.flash(format!("input error: {e}")),
+                    }
+                }
+                Some(stream_ev) = recv_stream(&mut self.in_flight) => {
+                    match stream_ev {
+                        StreamEvent::Token(t) => {
+                            if let Some(f) = self.in_flight.as_mut() {
+                                f.chars += t.chars().count();
+                            }
+                            self.stream.enqueue(t);
+                        }
+                        StreamEvent::Usage { total_tokens } => {
+                            if let Some(f) = self.in_flight.as_mut() {
+                                f.context_tokens = total_tokens;
+                            }
+                            self.last_context_tokens = total_tokens;
+                            self.last_context_limit = crate::provider::CONTEXT_WINDOW;
+                        }
+                    }
                 }
                 _ = tick.tick() => {}
             }
@@ -171,9 +330,16 @@ impl App {
         if self.welcome_done {
             return Ok(());
         }
-        let width = term_width(term);
-        let lines = render::welcome_page_lines(self, width);
-        insert_history_lines(term, lines)?;
+        let shape = crate::logo::logo_shape();
+        let lines = crate::logo::lines_for_scrollback(
+            shape,
+            ratatui::style::Color::Rgb(255, 140, 155),
+            ratatui::style::Color::Rgb(255, 180, 190),
+        );
+        // Add a blank line after the logo for spacing
+        let mut all_lines = lines;
+        all_lines.push(Line::raw(""));
+        insert_history_lines(term, all_lines)?;
         self.welcome_done = true;
         Ok(())
     }
@@ -198,6 +364,13 @@ impl App {
     }
 
     fn clear_terminal_ui(&mut self, term: &mut Term) -> Result<()> {
+        if self.is_fullscreen {
+            self.history.clear();
+            self.stream.drain_all();
+            self.route = Route::Home;
+            self.scroll_state = ScrollBoxState::new();
+            return Ok(());
+        }
         execute!(
             term.backend_mut(),
             Clear(ClearType::All),
@@ -225,17 +398,23 @@ impl App {
                     .unwrap_or_default();
                 match res {
                     Ok(StreamOutcome::Done) => {
-                        self.write_assistant_to_scrollback(term, &assistant_text)?;
-                    }
-                    Ok(StreamOutcome::Cancelled) => {
-                        self.write_assistant_to_scrollback(term, &assistant_text)?;
-                        self.write_note_to_scrollback(term, "(cancelled)")?;
-                    }
-                    Err(e) => {
-                        if !assistant_text.is_empty() {
+                        if !self.is_fullscreen {
                             self.write_assistant_to_scrollback(term, &assistant_text)?;
                         }
-                        self.write_note_to_scrollback(term, &format!("error: {e:#}"))?;
+                    }
+                    Ok(StreamOutcome::Cancelled) => {
+                        if !self.is_fullscreen {
+                            self.write_assistant_to_scrollback(term, &assistant_text)?;
+                            self.write_note_to_scrollback(term, "(cancelled)")?;
+                        }
+                    }
+                    Err(e) => {
+                        if !self.is_fullscreen {
+                            if !assistant_text.is_empty() {
+                                self.write_assistant_to_scrollback(term, &assistant_text)?;
+                            }
+                            self.write_note_to_scrollback(term, &format!("error: {e:#}"))?;
+                        }
                     }
                 }
                 self.in_flight = None;
@@ -263,6 +442,15 @@ impl App {
                     });
                 }
             }
+            CtEvent::Mouse(m) => match m.kind {
+                MouseEventKind::ScrollUp => {
+                    self.scroll_state.scroll_up(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_state.scroll_down(3, 200, 20);
+                }
+                _ => {}
+            },
             CtEvent::Resize(_, _) => self.rewrite_scrollback(term)?,
             _ => {}
         }
@@ -270,6 +458,26 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        // Dialog mode: only dialog keys are processed
+        if self.dialog_stack.is_open() {
+            let ctx = KeyContext::Dialog;
+            let action = keymap::resolve(&k, ctx);
+            match action {
+                Action::DialogClose => {
+                    self.dialog_stack.close();
+                }
+                Action::DialogConfirm | Action::DialogUp | Action::DialogDown => {
+                    if let Some(model) = self.dialog_stack.handle_key(action) {
+                        self.cfg.model = model;
+                        self.dialog_stack.close();
+                        self.flash(format!("model -> {}", self.cfg.model));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let ctx = if self.in_flight.is_some() {
             KeyContext::Streaming
         } else if self
@@ -304,6 +512,27 @@ impl App {
                 let input = ct_to_input(&k);
                 self.composer.input(input);
             }
+            Action::ScrollUp => {
+                self.scroll_state.scroll_up(3);
+            }
+            Action::ScrollDown => {
+                self.scroll_state.scroll_down(3, 200, 20);
+            }
+            Action::ScrollPageUp => {
+                self.scroll_state.scroll_up(20);
+            }
+            Action::ScrollPageDown => {
+                self.scroll_state.scroll_down(20, 200, 20);
+            }
+            Action::ScrollTop => {
+                self.scroll_state.scroll_to_top();
+            }
+            Action::ScrollBottom => {
+                self.scroll_state.scroll_to_bottom(200, 20);
+            }
+            Action::DialogUp | Action::DialogDown | Action::DialogConfirm | Action::DialogClose => {
+                // Dialog actions are handled before reaching here in on_key
+            }
         }
     }
 
@@ -322,9 +551,18 @@ impl App {
 
     fn drain_in_flight_tokens(&mut self) {
         if let Some(f) = self.in_flight.as_mut() {
-            while let Ok(StreamEvent::Token(t)) = f.token_rx.try_recv() {
-                f.chars += t.chars().count();
-                self.stream.enqueue(t);
+            while let Ok(ev) = f.token_rx.try_recv() {
+                match ev {
+                    StreamEvent::Token(t) => {
+                        f.chars += t.chars().count();
+                        self.stream.enqueue(t);
+                    }
+                    StreamEvent::Usage { total_tokens } => {
+                        f.context_tokens = total_tokens;
+                        self.last_context_tokens = total_tokens;
+                        self.last_context_limit = crate::provider::CONTEXT_WINDOW;
+                    }
+                }
             }
         }
     }
@@ -361,7 +599,12 @@ impl App {
             return Ok(());
         }
 
-        self.write_user_to_scrollback(term, &text)?;
+        // In split-footer mode, write user message to terminal scrollback.
+        // In fullscreen mode, messages are rendered in the virtual area.
+        if !self.is_fullscreen {
+            self.write_user_to_scrollback(term, &text)?;
+        }
+
         self.history.push(UiMessage {
             role: Role::User,
             text: text.clone(),
@@ -370,6 +613,11 @@ impl App {
             role: Role::Assistant,
             text: String::new(),
         });
+
+        // In fullscreen mode, transition from Home to Session route
+        if self.is_fullscreen && self.route == Route::Home {
+            self.route = Route::Session;
+        }
 
         let messages = prepend_system_prompt(
             &self.cfg,
@@ -402,6 +650,8 @@ impl App {
             cancel_tx: Some(cancel_tx),
             started: Instant::now(),
             chars: 0,
+            context_tokens: 0,
+            context_limit: crate::provider::CONTEXT_WINDOW,
         });
         Ok(())
     }
@@ -422,18 +672,26 @@ impl App {
                     self.cfg.model = m.to_string();
                     self.flash(format!("model -> {}", self.cfg.model));
                 }
-                None => self.flash(format!("model: {}", self.cfg.model)),
+                None => {
+                    if self.is_fullscreen {
+                        self.dialog_stack.open_model(&self.cfg);
+                    } else {
+                        self.flash(format!("model: {}", self.cfg.model));
+                    }
+                }
             },
-            "provider" => self.flash(format!(
-                "provider: {}  base_url: {}",
-                self.cfg.provider.as_str(),
-                self.cfg.base_url
-            )),
+            "provider" => self.flash("provider: DeepSeek  base_url: https://api.deepseek.com/v1".to_string()),
             "params" => self.flash(format!(
                 "temperature={:?}  top_p={:?}  max_tokens={:?}",
                 self.cfg.temperature, self.cfg.top_p, self.cfg.max_tokens
             )),
-            "help" => self.flash("/model [name] /provider /params /clear /exit".to_string()),
+            "help" => {
+                if self.is_fullscreen {
+                    self.dialog_stack.open_help();
+                } else {
+                    self.flash("/model [name] /provider /params /clear /exit".to_string());
+                }
+            }
             other => self.flash(format!("unknown command: /{other} (try /help)")),
         }
         Ok(())
@@ -469,6 +727,9 @@ impl App {
     }
 
     fn rewrite_scrollback(&mut self, term: &mut Term) -> Result<()> {
+        if self.is_fullscreen {
+            return Ok(());
+        }
         self.drain_in_flight_tokens();
         let pending = self.stream.drain_all();
         self.append_assistant_text(&pending);
@@ -559,11 +820,9 @@ fn ct_to_input(k: &KeyEvent) -> Input {
 mod tests {
     use super::*;
     use crate::config::{AltScreenMode, Persona, TuiConfig};
-    use crate::provider::Provider;
 
     fn test_cfg() -> ResolvedConfig {
         ResolvedConfig {
-            provider: Provider::DeepSeek,
             base_url: "https://example.test/v1".into(),
             api_key: "test-key".into(),
             model: "deepseek-v4-flash".into(),
@@ -582,9 +841,18 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
+    fn test_app_fullscreen(cfg: ResolvedConfig) -> App {
+        App::new_fullscreen(cfg, reqwest::Client::new())
+    }
+
+    fn test_app_split(cfg: ResolvedConfig) -> App {
+        App::new(cfg, reqwest::Client::new())
+    }
+
     #[test]
     fn replayable_history_keeps_finalized_messages() {
-        let mut app = App::new(test_cfg(), reqwest::Client::new());
+        let mut app = test_app_split(test_cfg());
         app.history.push(UiMessage {
             role: Role::User,
             text: "hello".into(),
@@ -602,7 +870,7 @@ mod tests {
 
     #[test]
     fn replayable_history_skips_streaming_assistant_tail() {
-        let mut app = App::new(test_cfg(), reqwest::Client::new());
+        let mut app = test_app_split(test_cfg());
         app.history.push(UiMessage {
             role: Role::User,
             text: "hello".into(),
@@ -618,6 +886,8 @@ mod tests {
             cancel_tx: Some(cancel_tx),
             started: Instant::now(),
             chars: 0,
+            context_tokens: 0,
+            context_limit: 0,
         });
 
         let replayable = app.replayable_history();

@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 
 use aili::chat::{Message, prepend_system_prompt};
 use aili::config::{self, LoadResult, ResolvedConfig};
-use aili::stream::{StreamEvent, StreamOutcome, probe_local, run_stream};
+use aili::stream::{StreamEvent, StreamOutcome, run_stream};
 use aili::wizard;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -11,9 +11,6 @@ use tokio::sync::mpsc;
 #[derive(Parser, Debug)]
 #[command(name = "aili", version, about = "Memory-first companion agent")]
 struct Cli {
-    /// Disable alternate screen overlays and keep terminal scrollback available.
-    #[arg(long, global = true)]
-    no_alt_screen: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -27,7 +24,7 @@ enum Cmd {
     },
     /// Re-run the first-time setup wizard.
     Init,
-    /// Start an interactive chat (or run a single turn with --once).
+    /// Start an interactive chat in split-footer mode (terminal scrollback preserved).
     Chat {
         /// Run a single turn with the given prompt and exit.
         #[arg(long)]
@@ -53,7 +50,6 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let no_alt_screen = cli.no_alt_screen;
     match cli.cmd {
         Some(Cmd::Config { action }) => match action {
             ConfigAction::Init => {
@@ -70,45 +66,32 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Some(Cmd::Init) => wizard::run(),
         Some(Cmd::Chat { once }) => {
-            let cfg = match config::load()? {
-                LoadResult::Loaded(c) => c,
-                LoadResult::NeedsInit => {
-                    wizard::run()?;
-                    match config::load()? {
-                        LoadResult::Loaded(c) => c,
-                        LoadResult::NeedsInit => {
-                            anyhow::bail!("wizard finished but config still uninitialized")
-                        }
-                    }
-                }
-            };
+            let cfg = resolve_config()?;
             let client = build_client()?;
-            probe_local(&client, &cfg).await?;
             match once {
                 Some(prompt) => once_turn(&client, &cfg, prompt).await,
-                None => {
-                    let _ = no_alt_screen;
-                    aili::tui::run(cfg, client).await
-                }
+                None => aili::tui::run_split(cfg, client).await,
             }
         }
         None => {
-            let cfg = match config::load()? {
-                LoadResult::Loaded(c) => c,
-                LoadResult::NeedsInit => {
-                    wizard::run()?;
-                    match config::load()? {
-                        LoadResult::Loaded(c) => c,
-                        LoadResult::NeedsInit => {
-                            anyhow::bail!("wizard finished but config still uninitialized")
-                        }
-                    }
-                }
-            };
+            let cfg = resolve_config()?;
             let client = build_client()?;
-            probe_local(&client, &cfg).await?;
-            let _ = no_alt_screen;
-            aili::tui::run(cfg, client).await
+            aili::tui::run_fullscreen(cfg, client).await
+        }
+    }
+}
+
+fn resolve_config() -> Result<ResolvedConfig> {
+    match config::load()? {
+        LoadResult::Loaded(c) => Ok(c),
+        LoadResult::NeedsInit => {
+            wizard::run()?;
+            match config::load()? {
+                LoadResult::Loaded(c) => Ok(c),
+                LoadResult::NeedsInit => {
+                    anyhow::bail!("wizard finished but config still uninitialized")
+                }
+            }
         }
     }
 }
@@ -129,9 +112,14 @@ async fn once_turn(client: &reqwest::Client, cfg: &ResolvedConfig, prompt: Strin
 
     let drain = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
-        while let Some(StreamEvent::Token(t)) = rx.recv().await {
-            out.write_all(t.as_bytes()).await.ok();
-            out.flush().await.ok();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                StreamEvent::Token(t) => {
+                    out.write_all(t.as_bytes()).await.ok();
+                    out.flush().await.ok();
+                }
+                StreamEvent::Usage { .. } => {}
+            }
         }
         out.write_all(b"\n").await.ok();
         out.flush().await.ok();

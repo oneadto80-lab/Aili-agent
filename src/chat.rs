@@ -31,14 +31,11 @@ impl Message {
 
 pub fn persona_system_prompt(cfg: &ResolvedConfig) -> String {
     let mut prompt = format!(
-        "You are Aili, a local-first terminal companion agent.\n\
+        "You are Aili, a local-first terminal companion agent powered by DeepSeek.\n\
          The user's preferred name is \"{}\".\n\
-         Always identify yourself as Aili. Do not identify yourself as {}, {}, DeepSeek, OpenAI, Anthropic, Gemini, Google, or any backend model/provider.\n\
-         The provider and model are implementation details only.\n\
+         Always identify yourself as Aili. Do not identify yourself as DeepSeek or any backend model/provider.\n\
          Reply in the user's language. Be concise, direct, and useful.",
         cfg.persona.user_name,
-        cfg.provider.as_str(),
-        cfg.model,
     );
     if !cfg.persona.description.trim().is_empty() {
         prompt.push_str("\nAdditional persona notes: ");
@@ -83,37 +80,13 @@ impl<'a> ChatRequest<'a> {
     }
 }
 
-/// Streaming SSE chunk shape (OpenAI-compatible).
-#[derive(Debug, Deserialize)]
-pub struct StreamChunk {
-    #[serde(default)]
-    pub choices: Vec<StreamChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StreamChoice {
-    #[serde(default)]
-    pub delta: StreamDelta,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct StreamDelta {
-    #[serde(default)]
-    pub content: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Persona, TuiConfig};
-    use crate::provider::Provider;
 
     fn cfg() -> ResolvedConfig {
         ResolvedConfig {
-            provider: Provider::DeepSeek,
             base_url: "https://api.deepseek.com/v1".into(),
             api_key: "sk-x".into(),
             model: "deepseek-v4-flash".into(),
@@ -135,18 +108,14 @@ mod tests {
         assert_eq!(v["model"], "deepseek-v4-flash");
         assert_eq!(v["stream"], true);
         assert_eq!(v["messages"][0]["role"], "system");
-        assert!(
-            v["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Aili")
-        );
-        assert!(
-            v["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Do not identify yourself")
-        );
+        assert!(v["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Aili"));
+        assert!(v["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Do not identify yourself"));
         assert_eq!(v["messages"][1]["role"], "user");
         assert_eq!(v["messages"][1]["content"], "hi");
         assert_eq!(v["temperature"], 0.5);
@@ -163,22 +132,6 @@ mod tests {
         assert!(prompt.contains("Aili"));
         assert!(prompt.contains("Rose"));
         assert!(prompt.contains("Do not identify yourself"));
-        assert!(prompt.contains("deepseek"));
-        assert!(prompt.contains("deepseek-v4-flash"));
-    }
-
-    #[test]
-    fn parses_delta_content() {
-        let json = r#"{"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}"#;
-        let c: StreamChunk = serde_json::from_str(json).unwrap();
-        assert_eq!(c.choices[0].delta.content.as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn parses_empty_delta() {
-        let json = r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
-        let c: StreamChunk = serde_json::from_str(json).unwrap();
-        assert!(c.choices[0].delta.content.is_none());
-        assert_eq!(c.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(prompt.contains("DeepSeek"));
     }
 }

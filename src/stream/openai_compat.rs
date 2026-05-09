@@ -4,7 +4,7 @@ use reqwest_eventsource::{Event, EventSource};
 use std::future::Future;
 use tokio::sync::mpsc;
 
-use crate::chat::{ChatRequest, Message, StreamChunk};
+use crate::chat::{ChatRequest, Message};
 use crate::config::ResolvedConfig;
 
 use super::{StreamEvent, StreamOutcome};
@@ -43,16 +43,31 @@ pub async fn run(
                             es.close();
                             return Ok(StreamOutcome::Done);
                         }
-                        let chunk: StreamChunk = match serde_json::from_str(&m.data) {
-                            Ok(c) => c,
+                        let value: serde_json::Value = match serde_json::from_str(&m.data) {
+                            Ok(v) => v,
                             Err(e) => bail!("malformed stream chunk: {e}\nraw: {}", m.data),
                         };
-                        for choice in &chunk.choices {
-                            if let Some(text) = &choice.delta.content {
-                                if tx.send(StreamEvent::Token(text.clone())).await.is_err() {
-                                    es.close();
-                                    return Ok(StreamOutcome::Cancelled);
+
+                        // Extract delta text tokens
+                        if let Some(choices) = value["choices"].as_array() {
+                            for choice in choices {
+                                if let Some(text) = choice["delta"]["content"].as_str() {
+                                    if !text.is_empty() {
+                                        if tx.send(StreamEvent::Token(text.to_string())).await.is_err() {
+                                            es.close();
+                                            return Ok(StreamOutcome::Cancelled);
+                                        }
+                                    }
                                 }
+                            }
+                        }
+
+                        // Extract usage from the final chunk
+                        if let Some(usage) = value.get("usage") {
+                            if let Some(total) = usage["total_tokens"].as_u64() {
+                                let _ = tx.send(StreamEvent::Usage {
+                                    total_tokens: total as usize,
+                                }).await;
                             }
                         }
                     }
@@ -75,32 +90,20 @@ async fn format_error(cfg: &ResolvedConfig, err: reqwest_eventsource::Error) -> 
         E::InvalidStatusCode(status, resp) => {
             let body = resp.text().await.unwrap_or_default();
             anyhow::anyhow!(
-                "request to {} failed with HTTP {}\nprovider: {}  model: {}\nbody: {}",
+                "request to {} failed with HTTP {}\nmodel: {}\nbody: {}",
                 cfg.base_url,
                 status,
-                cfg.provider.as_str(),
                 cfg.model,
                 body
             )
         }
         E::Transport(e) => {
-            let mut msg = format!(
-                "transport error contacting {} ({}): {}",
+            anyhow::anyhow!(
+                "transport error contacting {}: {}\nhint: check your network and that api.deepseek.com is reachable",
                 cfg.base_url,
-                cfg.provider.as_str(),
                 e
-            );
-            if cfg.provider.is_local() && (e.is_connect() || e.is_request()) {
-                msg.push_str("\nhint: ");
-                msg.push_str(cfg.provider.unreachable_hint());
-            }
-            anyhow::anyhow!(msg)
+            )
         }
-        other => anyhow::anyhow!(
-            "stream error from {} ({}): {}",
-            cfg.base_url,
-            cfg.provider.as_str(),
-            other
-        ),
+        other => anyhow::anyhow!("stream error from {}: {}", cfg.base_url, other),
     }
 }

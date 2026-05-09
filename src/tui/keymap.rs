@@ -10,6 +10,8 @@ pub enum KeyContext {
     IdleArmed,
     /// Idle, no quit-arm active.
     IdleUnarmed,
+    /// A dialog overlay is active (model select, help, etc).
+    Dialog,
 }
 
 /// What the app should *do* in response to a key. Decoupled from the key
@@ -28,6 +30,18 @@ pub enum Action {
     /// Pass the key event through to the composer (typing, cursor movement,
     /// editing — anything tui-textarea handles by default).
     ForwardToComposer,
+    /// Scroll the fullscreen session message history.
+    ScrollUp,
+    ScrollDown,
+    ScrollPageUp,
+    ScrollPageDown,
+    ScrollTop,
+    ScrollBottom,
+    /// Dialog navigation
+    DialogUp,
+    DialogDown,
+    DialogConfirm,
+    DialogClose,
 }
 
 /// Default keybindings. The function signature is the seam for future
@@ -38,21 +52,48 @@ pub fn resolve(k: &KeyEvent, ctx: KeyContext) -> Action {
     let shift = m.contains(KeyModifiers::SHIFT);
     let alt = m.contains(KeyModifiers::ALT);
 
+    // Dialog mode
+    if ctx == KeyContext::Dialog {
+        return match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => Action::DialogClose,
+            KeyCode::Up | KeyCode::Char('k') => Action::DialogUp,
+            KeyCode::Down | KeyCode::Char('j') => Action::DialogDown,
+            KeyCode::Enter => Action::DialogConfirm,
+            _ => Action::ForwardToComposer,
+        };
+    }
+
     if ctrl && k.code == KeyCode::Char('c') {
         return match ctx {
             KeyContext::Streaming => Action::CancelStream,
             KeyContext::IdleArmed => Action::QuitNow,
             KeyContext::IdleUnarmed => Action::QuitArm,
+            KeyContext::Dialog => Action::DialogClose,
         };
     }
     if ctrl && k.code == KeyCode::Char('d') {
-        return Action::QuitNow;
+        return if ctx == KeyContext::Dialog {
+            Action::DialogClose
+        } else {
+            Action::QuitNow
+        };
     }
     if k.code == KeyCode::Enter {
         if shift || alt {
             return Action::InsertNewline;
         }
         return Action::Submit;
+    }
+
+    // Scroll keys for fullscreen session mode
+    match k.code {
+        KeyCode::Up | KeyCode::Char('k') if ctrl => return Action::ScrollUp,
+        KeyCode::Down | KeyCode::Char('j') if ctrl => return Action::ScrollDown,
+        KeyCode::PageUp => return Action::ScrollPageUp,
+        KeyCode::PageDown => return Action::ScrollPageDown,
+        KeyCode::Home => return Action::ScrollTop,
+        KeyCode::End => return Action::ScrollBottom,
+        _ => {}
     }
 
     Action::ForwardToComposer
@@ -73,6 +114,12 @@ mod tests {
             KeyContext::Streaming,
         );
         assert_eq!(r, Action::CancelStream);
+    }
+
+    #[test]
+    fn esc_closes_dialog() {
+        let r = resolve(&key(KeyCode::Esc, KeyModifiers::NONE), KeyContext::Dialog);
+        assert_eq!(r, Action::DialogClose);
     }
 
     #[test]
